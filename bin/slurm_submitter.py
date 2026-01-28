@@ -84,7 +84,7 @@ class SlurmSubmitter:
 
         header = f"""#!/bin/bash
 """
-        # Add account only if present (not needed for tamia)
+        # Add account only if present (not needed for some clusters)
         if "account" in self.config:
             header += f"#SBATCH --account={self.config['account']}\n"
 
@@ -111,7 +111,7 @@ class SlurmSubmitter:
 
         mount_script = ""
 
-        # Add module load if present (for tamia)
+        # Add module load if present (for some clusters)
         if "module_load" in self.config:
             mount_script += f"""
 {self.config['module_load']}
@@ -129,7 +129,7 @@ mkdir -p {self.config['data_dest']}
 # 1) Parallel copy of Spectron sources to all nodes
 echo "Copying language/Spectron in parallel to all nodes..."
 srun --ntasks=$SLURM_JOB_NUM_NODES --ntasks-per-node=1 bash -c '
-cd {self.config['home_dir']}/spectron/
+cd {self.config['home_dir']}
 find spectron -mindepth 1 -maxdepth 1 -print0 | \\
   parallel -0 -j $SLURM_CPUS_PER_TASK rsync -a --inplace {{}} {self.config['code_dest']}/
 '
@@ -168,7 +168,7 @@ mkdir -p {self.config['data_dest']}
 
 # 1) Parallel copy of Spectron sources
 echo "Copying language/Spectron in parallel..."
-cd {self.config['home_dir']}/spectron/
+cd {self.config['home_dir']}
 find spectron -mindepth 1 -maxdepth 1 -print0 | \\
   parallel -0 -j $SLURM_CPUS_PER_TASK rsync -a --inplace {{}} {self.config['code_dest']}/
 
@@ -688,7 +688,7 @@ Examples:
     )
 
     parser.add_argument(
-        "--cluster", type=str, default="fir", help="Cluster name (default: fir)"
+        "--cluster", type=str, default="your_cluster", help="Cluster name (default: your_cluster)"
     )
     parser.add_argument(
         "--job-name", type=str, required=True, help="Base name for the job(s)"

@@ -57,8 +57,8 @@ def get_base_config(num_gpus: int = 7, virtual_workers_per_gpu: int = 1):
         "--val_files", "fineweb10B/fineweb_val_*.bin",
         
         # Wandb configuration
-        "--wandb_project", "gpt_subnet_training4",
-        "--wandb_entity", "eugenium40",
+        "--wandb_project", "gpt_subnet_training",
+        "--wandb_entity", "your_username",
     ]
 
 def main():

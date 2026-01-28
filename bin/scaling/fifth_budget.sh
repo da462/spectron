@@ -39,7 +39,7 @@ for i in "${!flavors[@]}"; do
         --grid total_steps="$steps" \
         --param micro_batch_size=4 \
         --param weight_decay=1e-2 \
-        --param nh_weight_decay=1e-2
+        --param nh_weight_decay=1e-2 --dry-run
 
     # Check if the command was successful
     if [ $? -eq 0 ]; then
