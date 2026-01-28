@@ -585,7 +585,7 @@ If you use this codebase, please cite:
 
 ```bibtex
 @inproceedings{anonymous2024lowrank,
-  title={Low-Rank Self-Guided Training for Language Models},
+  title={Stablizing low rank training},
   author={Anonymous},
   booktitle={International Conference on Machine Learning (ICML)},
   year={2026}
