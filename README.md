@@ -588,7 +588,7 @@ If you use this codebase, please cite:
   title={Low-Rank Self-Guided Training for Language Models},
   author={Anonymous},
   booktitle={International Conference on Machine Learning (ICML)},
-  year={2024}
+  year={2026}
 }
 ```
 
