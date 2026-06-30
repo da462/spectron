@@ -17,7 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from power_iter import get_lowrank_spectral_norm_scaling
 from matrix_analysis import compute_matrix_metrics
-# Base seed for reproducibility
+# Base seed for reproducibility. Keep the historical default unless a run
+# explicitly overrides it.
 BASE_SEED = 1337
 
 # Conditional import for Muon optimizer
@@ -554,6 +555,7 @@ def main():
 
     parser.add_argument('--total_steps', type=int, default=1000)
     parser.add_argument('--warmup_ratio', type=float, default=0.05, help='Warmup ratio (warmup_steps = warmup_ratio * total_steps)')
+    parser.add_argument('--seed', type=int, default=BASE_SEED, help='Base random seed for model init and data-worker RNGs')
     parser.add_argument('--log_interval', type=int, default=10)
     parser.add_argument('--max_val_samples', type=int, default=1000)  # Limit validation samples for faster eval
 
@@ -566,6 +568,8 @@ def main():
                         help='Muon learning rate adjustment function: original (sqrt(max(1, A/B))), match_rms_adamw (0.2*sqrt(max(A,B))), or none (no adjustment)')
     parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'wsd'],
                         help='Learning rate scheduler to use: cosine or wsd (warmup-stable-decay)')
+    parser.add_argument('--min_lr_factor', type=float, default=0.1,
+                        help='Final LR as a fraction of max_lr for cosine AdamW schedule')
 
     # Model config
     parser.add_argument('--hidden_size', type=int, default=768)
@@ -579,6 +583,8 @@ def main():
     parser.add_argument('--layer_norm_epsilon', type=float, default=1e-5)
     parser.add_argument('--n_kv_heads', type=int, default=None)
     parser.add_argument('--multiple_of', type=int, default=256)
+    parser.add_argument('--ffn_dim_multiplier', type=float, default=None)
+    parser.add_argument('--rope_theta', type=float, default=10000.0)
 
     # Subnet config
     parser.add_argument('--stochastic_depth', action='store_true')
@@ -649,6 +655,8 @@ def main():
 
     # Calculate warmup steps from warmup ratio
     args.warmup_steps = int(args.warmup_ratio * args.total_steps)
+    if args.min_lr_factor < 0:
+        raise ValueError("--min_lr_factor must be non-negative")
 
     # Validate Muon optimizer availability
     if args.optimizer == 'muon' and not MUON_AVAILABLE:
@@ -686,7 +694,7 @@ def main():
     print(f"Rank {rank}/{world_size} (local rank {local_rank}) on device {device}")
 
     # Seed everything for reproducibility BEFORE model creation
-    seed_everything(BASE_SEED, rank)
+    seed_everything(args.seed, rank)
 
     # Virtual world setup
     virtual_workers_per_gpu = max(1, int(getattr(args, 'virtual_workers_per_gpu', 1)))
@@ -707,6 +715,8 @@ def main():
         use_flex_attn=args.use_flex_attn,
         n_kv_heads=args.n_kv_heads,
         multiple_of=args.multiple_of,
+        ffn_dim_multiplier=args.ffn_dim_multiplier,
+        rope_theta=args.rope_theta,
     )
     model = TitanGPT(model_args).to(device)
 
@@ -1076,7 +1086,7 @@ def main():
             cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 shared_optimizer,
                 T_max=args.total_steps - args.warmup_steps,  # Cosine decay for remaining steps
-                eta_min=args.max_lr * 0.1,  # Decay to 0.1 * max_lr
+                eta_min=args.max_lr * args.min_lr_factor,
             )
             scheduler = torch.optim.lr_scheduler.SequentialLR(
                 shared_optimizer,
@@ -1260,7 +1270,7 @@ def main():
     if args.scheduler == 'wsd':
         print(f"Learning rate schedule: WSD (warmup for {args.warmup_steps} steps [{args.warmup_ratio*100:.1f}% of {args.total_steps}], stable phase, then decay to {0.1 * args.max_lr:.6f})")
     else:
-        print(f"Learning rate schedule: {args.scheduler} (warmup for {args.warmup_steps} steps [{args.warmup_ratio*100:.1f}% of {args.total_steps}], then decay to {0.1 * args.max_lr:.6f})")
+        print(f"Learning rate schedule: {args.scheduler} (warmup for {args.warmup_steps} steps [{args.warmup_ratio*100:.1f}% of {args.total_steps}], then decay to {args.min_lr_factor * args.max_lr:.6f})")
 
     if rank == 0:
         print(f"\nCheckpointing configuration:")
