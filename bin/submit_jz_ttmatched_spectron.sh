@@ -3,9 +3,6 @@ set -euo pipefail
 
 PROFILE="${1:-h100_4_dev2h_cpu30_whj}"
 RUN_MODE="${2:-lowrank_all}"
-if [[ "$RUN_MODE" == "134m" ]]; then
-  RUN_MODE="${3:-lowrank_all}"
-fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="${LOG_DIR:-$REPO_DIR/jz_logs}"
@@ -43,6 +40,15 @@ case "$PROFILE" in
     ;;
 esac
 
+case "$RUN_MODE" in
+  fullrank|lowrank_all|lowrank_attention|lowrank_ffn)
+    ;;
+  *)
+    echo "Unknown RUN_MODE '$RUN_MODE'. Use fullrank, lowrank_all, lowrank_attention, or lowrank_ffn." >&2
+    exit 2
+    ;;
+esac
+
 cat > "$JOB_SCRIPT" <<EOF
 #!/usr/bin/env bash
 #SBATCH --job-name=$JOB_NAME
@@ -75,7 +81,95 @@ fi
 export WANDB_MODE="\${WANDB_MODE:-offline}"
 export NPROC_PER_NODE="\${NPROC_PER_NODE:-$GPUS}"
 
-./bin/run_ttmatched_spectron_rope_adamw.sh "$RUN_MODE"
+RUN_MODE="$RUN_MODE"
+DATA_ROOT="\${DATA_ROOT:-/lustre/fswork/projects/rech/qps/ulf36rc/spectron_data/fineweb_llama2}"
+CHECKPOINT_ROOT="\${CHECKPOINT_ROOT:-/lustre/fswork/projects/rech/qps/ulf36rc/spectron_checkpoints}"
+WANDB_PROJECT="\${WANDB_PROJECT:-spectron_attnrank}"
+WANDB_ENTITY="\${WANDB_ENTITY:-da462}"
+TOTAL_STEPS="\${TOTAL_STEPS:-500}"
+LR_SCHEDULE_STEPS="\${LR_SCHEDULE_STEPS:-2555}"
+GLOBAL_BATCH_SIZE="\${GLOBAL_BATCH_SIZE:-512}"
+MICRO_BATCH_SIZE="\${MICRO_BATCH_SIZE:-16}"
+LOG_INTERVAL="\${LOG_INTERVAL:-10}"
+MAX_VAL_SAMPLES="\${MAX_VAL_SAMPLES:-100}"
+CHECKPOINT_INTERVAL_HOURS="\${CHECKPOINT_INTERVAL_HOURS:-2.8}"
+RUN_NAME="\${RUN_NAME:-spectron_tt134m_fineweb_adamw_lr5e3_wd0p1_seq2048_steps\${TOTAL_STEPS}_sched\${LR_SCHEDULE_STEPS}_rope10000_\${RUN_MODE}}"
+
+LOW_RANK_FLAGS=()
+case "\$RUN_MODE" in
+  fullrank)
+    ;;
+  lowrank_all)
+    LOW_RANK_FLAGS=(
+      --low_rank
+      --low_rank_ratio 0.25
+      --disable_c
+      --exclude_modules tok_embeddings output
+    )
+    ;;
+  lowrank_attention)
+    LOW_RANK_FLAGS=(
+      --low_rank
+      --low_rank_ratio 0.25
+      --disable_c
+      --exclude_modules tok_embeddings output feed_forward
+    )
+    ;;
+  lowrank_ffn)
+    LOW_RANK_FLAGS=(
+      --low_rank
+      --low_rank_ratio 0.25
+      --disable_c
+      --exclude_modules tok_embeddings output attention
+    )
+    ;;
+esac
+
+echo "Spectron TT-matched AdamW run"
+echo "  model_size=134m hidden=768 layers=12 heads=12"
+echo "  run_mode=\$RUN_MODE rope_theta=10000 seq_len=2048 total_steps=\$TOTAL_STEPS lr_schedule_steps=\$LR_SCHEDULE_STEPS"
+echo "  lr=5e-3 weight_decay=0.1 batch=\$GLOBAL_BATCH_SIZE micro_batch=\$MICRO_BATCH_SIZE"
+echo "  data_root=\$DATA_ROOT"
+echo "  run_name=\$RUN_NAME"
+echo "  wandb_mode=\$WANDB_MODE"
+
+exec torchrun --nproc_per_node="\$NPROC_PER_NODE" simple_gpt_training.py \\
+  --seed 1234 \\
+  --hidden_size 768 \\
+  --num_layers 12 \\
+  --num_heads 12 \\
+  --n_kv_heads 12 \\
+  --vocab_size 32000 \\
+  --max_position_embeddings 2048 \\
+  --train_seq_len 2048 \\
+  --val_seq_len 2048 \\
+  --multiple_of 256 \\
+  --rope_theta 10000 \\
+  --optimizer adamw \\
+  --max_lr 5e-3 \\
+  --weight_decay 0.1 \\
+  --adam_beta1 0.9 \\
+  --adam_beta2 0.95 \\
+  --scheduler cosine \\
+  --min_lr_factor 0.0 \\
+  --batch_size "\$GLOBAL_BATCH_SIZE" \\
+  --micro_batch_size "\$MICRO_BATCH_SIZE" \\
+  --total_steps "\$TOTAL_STEPS" \\
+  --lr_schedule_steps "\$LR_SCHEDULE_STEPS" \\
+  --warmup_ratio 0.05 \\
+  --log_interval "\$LOG_INTERVAL" \\
+  --use_flex_attn \\
+  --bf16 \\
+  --virtual_workers_per_gpu 1 \\
+  --max_val_samples "\$MAX_VAL_SAMPLES" \\
+  --checkpoint_interval_hours "\$CHECKPOINT_INTERVAL_HOURS" \\
+  --train_files "\$DATA_ROOT/fineweb_train_*.bin" \\
+  --val_files "\$DATA_ROOT/fineweb_val_*.bin" \\
+  --checkpoint_dir "\$CHECKPOINT_ROOT/\$RUN_NAME" \\
+  --wandb_project "\$WANDB_PROJECT" \\
+  --wandb_entity "\$WANDB_ENTITY" \\
+  --run_name "\$RUN_NAME" \\
+  "\${LOW_RANK_FLAGS[@]}"
 EOF
 
 echo "Submitting $JOB_SCRIPT"
