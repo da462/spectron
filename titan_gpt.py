@@ -9,8 +9,37 @@ import torch.nn.functional as F
 from torch import nn
 from dataclasses import dataclass
 
-# Direct import from torchtitan, as requested
-from torchtitan.models.attention import build_attention, init_attention_mask
+# Prefer the legacy TorchTitan helper when it exists. Newer TorchTitan checkouts
+# moved attention internals under torchtitan.models.common and no longer expose
+# torchtitan.models.attention, so keep a local SDPA fallback for this repo's
+# default causal path.
+try:
+    from torchtitan.models.attention import build_attention, init_attention_mask
+except ModuleNotFoundError:
+    class _CausalSDPAAttention(nn.Module):
+        def forward(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+        ) -> torch.Tensor:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+    def build_attention(use_flex_attn: bool, attn_mask_type: str) -> nn.Module:
+        if use_flex_attn:
+            raise ImportError(
+                "This TorchTitan checkout does not expose "
+                "torchtitan.models.attention. Run without --use_flex_attn or "
+                "install a TorchTitan version that provides the legacy helper."
+            )
+        if attn_mask_type != "causal":
+            raise ValueError(
+                f"Local SDPA fallback only supports causal masks, got {attn_mask_type!r}"
+            )
+        return _CausalSDPAAttention()
+
+    def init_attention_mask(*args, **kwargs) -> None:
+        return None
 
 # --- Model Args ---
 
