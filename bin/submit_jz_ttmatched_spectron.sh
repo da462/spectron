@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROFILE="${1:-h100_4_dev2h_cpu30_whj}"
+PROFILE="${1:-h100_4_dev2h_cpu30_qps}"
 RUN_MODE="${2:-lowrank_all}"
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,7 +16,7 @@ JOB_NAME="spectron_tt134m_${RUN_MODE}_steps${JOB_STEPS}_sched${JOB_SCHEDULE_STEP
 JOB_SCRIPT="$JOB_DIR/${JOB_NAME}_${PROFILE}_${RUN_STAMP}.slurm"
 
 case "$PROFILE" in
-  h100_4_dev2h_cpu30_whj)
+  h100_4_dev2h_cpu30_qps)
     ACCOUNT="qps@h100"
     PARTITION="gpu_p6"
     QOS="qos_gpu_h100-dev"
@@ -35,7 +35,7 @@ case "$PROFILE" in
     TIME_LIMIT="00:20:00"
     ;;
   *)
-    echo "Unknown PROFILE '$PROFILE'. Use h100_4_dev2h_cpu30_whj or a100_dev_20m." >&2
+    echo "Unknown PROFILE '$PROFILE'. Use h100_4_dev2h_cpu30_qps or a100_dev_20m." >&2
     exit 2
     ;;
 esac
