@@ -1,13 +1,13 @@
-# TorchTitan-Matched Spectron RoPE Runs
+# TorchTitan-Shaped 134M Spectron RoPE 500-Step Run
 
-These wrappers run Spectron on JZ FineWeb bins with the TorchTitan model shapes
-we want to compare against and TorchTitan-style AdamW hyperparameters, while
-keeping Spectron's RoPE theta (`10000`).
+These wrappers run a 500-step Spectron diagnostic on JZ FineWeb bins with the
+134M TorchTitan/attnrank model shape and TorchTitan-style AdamW hyperparameters,
+while keeping Spectron's RoPE theta (`10000`).
 
-## Model Presets
+## Model Preset
 
-`134m` matches the attnrank TorchTitan `llama3._134m_rope` shape, except RoPE
-theta is set back to Spectron's `10000`:
+The run matches the attnrank TorchTitan `llama3._134m_rope` shape, except RoPE
+theta is set to Spectron's `10000`:
 
 - `dim=768`
 - `n_layers=12`
@@ -17,23 +17,14 @@ theta is set back to Spectron's `10000`:
 - `vocab_size=32000`
 - untied token embedding/output weights
 
-`500m` uses the TorchTitan `llama3._500m` matrix shapes, but keeps Spectron's
-untied embedding/output behavior:
-
-- `dim=1280`
-- `n_layers=20`
-- `n_heads=20`
-- MHA (`n_kv_heads=20`)
-- `ffn_hidden_dim=5120` via `multiple_of=1024`, `ffn_dim_multiplier=1.5`
-- `vocab_size=32000`
-- untied token embedding/output weights
-
-Both presets use:
+The wrapper also uses:
 
 - `rope_theta=10000`
 - `seq_len=2048`
 - AdamW `lr=5e-3`, `weight_decay=0.1`, betas `(0.9, 0.95)`
-- cosine decay over `2555` steps with `5%` warmup and `min_lr=0`
+- run length `500` steps
+- LR schedule horizon `2555` steps: warmup is `5%` of `2555` steps, then cosine
+  decay toward zero at step `2555`
 - global batch `512`, micro batch `16`
 - `seed=1234`
 - WandB offline by default
@@ -46,29 +37,26 @@ eligible linear layers except embeddings/output:
 ```bash
 cd /lustre/fswork/projects/rech/qps/ulf36rc/spectron
 
-./bin/run_ttmatched_spectron_rope_adamw.sh 134m lowrank_all
-./bin/run_ttmatched_spectron_rope_adamw.sh 500m lowrank_all
+./bin/run_ttmatched_spectron_rope_adamw.sh lowrank_all
 ```
 
 Full-rank controls:
 
 ```bash
-./bin/run_ttmatched_spectron_rope_adamw.sh 134m fullrank
-./bin/run_ttmatched_spectron_rope_adamw.sh 500m fullrank
+./bin/run_ttmatched_spectron_rope_adamw.sh fullrank
 ```
 
 JZ Slurm helper examples:
 
 ```bash
-./bin/submit_jz_ttmatched_spectron.sh h100_4_dev2h_cpu30_whj 134m lowrank_all
-./bin/submit_jz_ttmatched_spectron.sh h100_4_dev2h_cpu30_whj 500m lowrank_all
+./bin/submit_jz_ttmatched_spectron.sh h100_4_dev2h_cpu30_whj lowrank_all
 ```
 
 For a short A100 sanity run, override steps and use the dev profile:
 
 ```bash
 TOTAL_STEPS=20 MAX_VAL_SAMPLES=8 \
-./bin/submit_jz_ttmatched_spectron.sh a100_dev_20m 134m lowrank_all
+./bin/submit_jz_ttmatched_spectron.sh a100_dev_20m lowrank_all
 ```
 
 ## Data
@@ -101,6 +89,9 @@ This setup changes the regular Spectron script in these ways:
   `134M_rope` theta (`500000`).
 - Uses Spectron's low-rank replacement for `lowrank_all`: SVD-initialized AB
   factors with rank ratio `0.25`, excluding embeddings/output.
+- Defaults to `500` training steps while preserving the `2555`-step LR schedule.
+  Override `TOTAL_STEPS` and `LR_SCHEDULE_STEPS` separately only when
+  intentionally changing those semantics.
 
 Remaining differences from TorchTitan training:
 
@@ -108,6 +99,4 @@ Remaining differences from TorchTitan training:
   TorchTitan's streaming FineWeb dataloader or packed-document masks.
 - Spectron's attention path is causal SDPA over the contiguous stream.
 - Spectron init and training loop details remain Spectron's implementation.
-- The 500M shape is not weight-tied, so it is shape-matched rather than an exact
-  TorchTitan `_500m` parameterization.
 - The wrapper does not add TorchTitan attnrank spectral diagnostics.

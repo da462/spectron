@@ -2,8 +2,10 @@
 set -euo pipefail
 
 PROFILE="${1:-h100_4_dev2h_cpu30_whj}"
-MODEL_SIZE="${2:-134m}"
-RUN_MODE="${3:-lowrank_all}"
+RUN_MODE="${2:-lowrank_all}"
+if [[ "$RUN_MODE" == "134m" ]]; then
+  RUN_MODE="${3:-lowrank_all}"
+fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="${LOG_DIR:-$REPO_DIR/jz_logs}"
@@ -11,7 +13,9 @@ JOB_DIR="${JOB_DIR:-$REPO_DIR/jobs}"
 mkdir -p "$LOG_DIR" "$JOB_DIR"
 
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
-JOB_NAME="spectron_${MODEL_SIZE}_${RUN_MODE}"
+JOB_STEPS="${TOTAL_STEPS:-500}"
+JOB_SCHEDULE_STEPS="${LR_SCHEDULE_STEPS:-2555}"
+JOB_NAME="spectron_tt134m_${RUN_MODE}_steps${JOB_STEPS}_sched${JOB_SCHEDULE_STEPS}"
 JOB_SCRIPT="$JOB_DIR/${JOB_NAME}_${PROFILE}_${RUN_STAMP}.slurm"
 
 case "$PROFILE" in
@@ -70,7 +74,7 @@ fi
 export WANDB_MODE="\${WANDB_MODE:-offline}"
 export NPROC_PER_NODE="\${NPROC_PER_NODE:-$GPUS}"
 
-./bin/run_ttmatched_spectron_rope_adamw.sh "$MODEL_SIZE" "$RUN_MODE"
+./bin/run_ttmatched_spectron_rope_adamw.sh "$RUN_MODE"
 EOF
 
 echo "Submitting $JOB_SCRIPT"

@@ -554,7 +554,9 @@ def main():
     parser.add_argument('--nh_weight_decay', type=float, default=0.1, help='Non-hidden weight decay (default: 0.0)')
 
     parser.add_argument('--total_steps', type=int, default=1000)
-    parser.add_argument('--warmup_ratio', type=float, default=0.05, help='Warmup ratio (warmup_steps = warmup_ratio * total_steps)')
+    parser.add_argument('--lr_schedule_steps', type=int, default=None,
+                        help='Number of steps used to shape warmup/cosine LR schedule. Defaults to total_steps.')
+    parser.add_argument('--warmup_ratio', type=float, default=0.05, help='Warmup ratio (warmup_steps = warmup_ratio * lr_schedule_steps)')
     parser.add_argument('--seed', type=int, default=BASE_SEED, help='Base random seed for model init and data-worker RNGs')
     parser.add_argument('--log_interval', type=int, default=10)
     parser.add_argument('--max_val_samples', type=int, default=1000)  # Limit validation samples for faster eval
@@ -653,8 +655,12 @@ def main():
                         help='Save checkpoint when best validation loss is achieved')
     args = parser.parse_args()
 
-    # Calculate warmup steps from warmup ratio
-    args.warmup_steps = int(args.warmup_ratio * args.total_steps)
+    # Calculate warmup from the schedule horizon. This lets short diagnostic
+    # jobs stop early while keeping the same LR values as a longer reference run.
+    args.lr_schedule_steps = args.lr_schedule_steps or args.total_steps
+    if args.lr_schedule_steps <= 0:
+        raise ValueError("--lr_schedule_steps must be positive")
+    args.warmup_steps = int(args.warmup_ratio * args.lr_schedule_steps)
     if args.min_lr_factor < 0:
         raise ValueError("--min_lr_factor must be non-negative")
 
@@ -1047,7 +1053,7 @@ def main():
     if args.scheduler == 'wsd':
         # WSD (Warmup-Stable-Decay) scheduler
         lr_lambda = wsd_schedule(
-            n_iterations=args.total_steps,
+            n_iterations=args.lr_schedule_steps,
             final_lr_factor=0.001,  # Decay to 0.1 * max_lr
             n_warmup=args.warmup_steps,
             init_div_factor=10,  # Start from 0.1 * max_lr during warmup
@@ -1068,7 +1074,7 @@ def main():
                     return step / args.warmup_steps
                 else:
                     # Cosine decay from 1.0 to 0.0
-                    progress = (step - args.warmup_steps) / (args.total_steps - args.warmup_steps)
+                    progress = (step - args.warmup_steps) / (args.lr_schedule_steps - args.warmup_steps)
                     return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)))
 
             scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -1085,7 +1091,7 @@ def main():
             )
             cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 shared_optimizer,
-                T_max=args.total_steps - args.warmup_steps,  # Cosine decay for remaining steps
+                T_max=args.lr_schedule_steps - args.warmup_steps,  # Cosine decay for remaining steps
                 eta_min=args.max_lr * args.min_lr_factor,
             )
             scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -1268,9 +1274,9 @@ def main():
 
     print(f"Worker {rank} starting training...")
     if args.scheduler == 'wsd':
-        print(f"Learning rate schedule: WSD (warmup for {args.warmup_steps} steps [{args.warmup_ratio*100:.1f}% of {args.total_steps}], stable phase, then decay to {0.1 * args.max_lr:.6f})")
+        print(f"Learning rate schedule: WSD (run for {args.total_steps} steps; schedule horizon {args.lr_schedule_steps}, warmup for {args.warmup_steps} steps [{args.warmup_ratio*100:.1f}% of schedule], stable phase, then decay to {0.1 * args.max_lr:.6f})")
     else:
-        print(f"Learning rate schedule: {args.scheduler} (warmup for {args.warmup_steps} steps [{args.warmup_ratio*100:.1f}% of {args.total_steps}], then decay to {args.min_lr_factor * args.max_lr:.6f})")
+        print(f"Learning rate schedule: {args.scheduler} (run for {args.total_steps} steps; schedule horizon {args.lr_schedule_steps}, warmup for {args.warmup_steps} steps [{args.warmup_ratio*100:.1f}% of schedule], then decay to {args.min_lr_factor * args.max_lr:.6f})")
 
     if rank == 0:
         print(f"\nCheckpointing configuration:")

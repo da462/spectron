@@ -4,12 +4,13 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_DIR"
 
-MODEL_SIZE="${MODEL_SIZE:-134m}"
 RUN_MODE="${RUN_MODE:-lowrank_all}"
 
 if [[ $# -gt 0 && "$1" != --* ]]; then
-  MODEL_SIZE="$1"
-  shift
+  # Backward-compatible no-op for the first version of this wrapper.
+  if [[ "$1" == "134m" ]]; then
+    shift
+  fi
 fi
 
 if [[ $# -gt 0 && "$1" != --* ]]; then
@@ -17,30 +18,13 @@ if [[ $# -gt 0 && "$1" != --* ]]; then
   shift
 fi
 
-case "$MODEL_SIZE" in
-  134m)
-    MODEL_TAG="tt134m"
-    HIDDEN_SIZE=768
-    NUM_LAYERS=12
-    NUM_HEADS=12
-    N_KV_HEADS=12
-    MULTIPLE_OF=256
-    FFN_DIM_MULTIPLIER=""
-    ;;
-  500m)
-    MODEL_TAG="tt500m"
-    HIDDEN_SIZE=1280
-    NUM_LAYERS=20
-    NUM_HEADS=20
-    N_KV_HEADS=20
-    MULTIPLE_OF=1024
-    FFN_DIM_MULTIPLIER=1.5
-    ;;
-  *)
-    echo "Unknown MODEL_SIZE '$MODEL_SIZE'. Use 134m or 500m." >&2
-    exit 2
-    ;;
-esac
+MODEL_TAG="tt134m"
+HIDDEN_SIZE=768
+NUM_LAYERS=12
+NUM_HEADS=12
+N_KV_HEADS=12
+MULTIPLE_OF=256
+FFN_DIM_MULTIPLIER=""
 
 LOW_RANK_FLAGS=()
 case "$RUN_MODE" in
@@ -70,7 +54,8 @@ export WANDB_MODE
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 ROPE_THETA="${ROPE_THETA:-10000}"
 SEQ_LEN="${SEQ_LEN:-2048}"
-TOTAL_STEPS="${TOTAL_STEPS:-2555}"
+TOTAL_STEPS="${TOTAL_STEPS:-500}"
+LR_SCHEDULE_STEPS="${LR_SCHEDULE_STEPS:-2555}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 MAX_LR="${MAX_LR:-5e-3}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
@@ -81,7 +66,7 @@ MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-100}"
 CHECKPOINT_INTERVAL_HOURS="${CHECKPOINT_INTERVAL_HOURS:-2.8}"
 
 ROPE_TAG="${ROPE_THETA//./p}"
-RUN_NAME="${RUN_NAME:-spectron_${MODEL_TAG}_fineweb_adamw_lr5e3_wd0p1_seq${SEQ_LEN}_rope${ROPE_TAG}_${RUN_MODE}}"
+RUN_NAME="${RUN_NAME:-spectron_${MODEL_TAG}_fineweb_adamw_lr5e3_wd0p1_seq${SEQ_LEN}_steps${TOTAL_STEPS}_sched${LR_SCHEDULE_STEPS}_rope${ROPE_TAG}_${RUN_MODE}}"
 
 FFN_DIM_MULTIPLIER_FLAGS=()
 if [[ -n "$FFN_DIM_MULTIPLIER" ]]; then
@@ -89,8 +74,8 @@ if [[ -n "$FFN_DIM_MULTIPLIER" ]]; then
 fi
 
 echo "Spectron TT-matched AdamW run"
-echo "  model_size=$MODEL_SIZE hidden=$HIDDEN_SIZE layers=$NUM_LAYERS heads=$NUM_HEADS ffn_multiplier=$FFN_DIM_MULTIPLIER"
-echo "  run_mode=$RUN_MODE rope_theta=$ROPE_THETA seq_len=$SEQ_LEN total_steps=$TOTAL_STEPS"
+echo "  model_size=134m hidden=$HIDDEN_SIZE layers=$NUM_LAYERS heads=$NUM_HEADS ffn_multiplier=$FFN_DIM_MULTIPLIER"
+echo "  run_mode=$RUN_MODE rope_theta=$ROPE_THETA seq_len=$SEQ_LEN total_steps=$TOTAL_STEPS lr_schedule_steps=$LR_SCHEDULE_STEPS"
 echo "  lr=$MAX_LR weight_decay=$WEIGHT_DECAY batch=$GLOBAL_BATCH_SIZE micro_batch=$MICRO_BATCH_SIZE"
 echo "  data_root=$DATA_ROOT"
 echo "  run_name=$RUN_NAME"
@@ -119,6 +104,7 @@ exec torchrun --nproc_per_node="$NPROC_PER_NODE" simple_gpt_training.py \
   --batch_size "$GLOBAL_BATCH_SIZE" \
   --micro_batch_size "$MICRO_BATCH_SIZE" \
   --total_steps "$TOTAL_STEPS" \
+  --lr_schedule_steps "$LR_SCHEDULE_STEPS" \
   --warmup_ratio "$WARMUP_RATIO" \
   --log_interval "$LOG_INTERVAL" \
   --bf16 \
