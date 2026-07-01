@@ -83,6 +83,5 @@ RUN_NAME=my_run_name \
 ./bin/run_tt134m_fineweb_adamw.sh lowrank_all
 ```
 
-The wrapper intentionally does not set `--use_flex_attn`; it uses the model's
-default SDPA path with continuous RoPE positions, matching Spectron's existing
-TitanGPT attention behavior.
+The wrapper uses Spectron's original `--use_flex_attn` path, which imports the
+attention backend from the `torchtitan` Python package declared by Spectron.

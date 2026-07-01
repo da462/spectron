@@ -65,10 +65,11 @@ source /etc/profile.d/proxy.sh || true
 
 if [[ -n "\${JZ_VENV:-}" ]]; then
   source "\$JZ_VENV/bin/activate"
-elif [[ -d /lustre/fswork/projects/rech/qps/ulf36rc/tt/.venv_h100 ]]; then
-  source /lustre/fswork/projects/rech/qps/ulf36rc/tt/.venv_h100/bin/activate
-elif [[ -d /lustre/fswork/projects/rech/qps/ulf36rc/tt/.venv ]]; then
-  source /lustre/fswork/projects/rech/qps/ulf36rc/tt/.venv/bin/activate
+elif [[ -d "$REPO_DIR/.venv_spectron" ]]; then
+  source "$REPO_DIR/.venv_spectron/bin/activate"
+else
+  echo "No Spectron venv found. Set JZ_VENV or create $REPO_DIR/.venv_spectron." >&2
+  exit 1
 fi
 
 export WANDB_MODE="\${WANDB_MODE:-offline}"

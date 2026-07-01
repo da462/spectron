@@ -97,6 +97,7 @@ Remaining differences from TorchTitan training:
 
 - Spectron reads contiguous pretokenized `.bin` streams; it does not use
   TorchTitan's streaming FineWeb dataloader or packed-document masks.
-- Spectron's attention path is causal SDPA over the contiguous stream.
+- Spectron's attention path uses its original `--use_flex_attn` backend from
+  the `torchtitan` Python package.
 - Spectron init and training loop details remain Spectron's implementation.
 - The wrapper does not add TorchTitan attnrank spectral diagnostics.

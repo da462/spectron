@@ -107,6 +107,7 @@ exec torchrun --nproc_per_node="$NPROC_PER_NODE" simple_gpt_training.py \
   --lr_schedule_steps "$LR_SCHEDULE_STEPS" \
   --warmup_ratio "$WARMUP_RATIO" \
   --log_interval "$LOG_INTERVAL" \
+  --use_flex_attn \
   --bf16 \
   --virtual_workers_per_gpu 1 \
   --max_val_samples "$MAX_VAL_SAMPLES" \
