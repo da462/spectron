@@ -215,6 +215,24 @@ def save_checkpoint(
     return checkpoint_path
 
 
+def prune_step_checkpoints(checkpoint_dir: str, keep_latest_k: int) -> None:
+    if keep_latest_k < 0:
+        return
+
+    checkpoint_paths = sorted(
+        Path(checkpoint_dir).glob("checkpoint_step_*.pt"),
+        key=lambda path: (path.stat().st_mtime, path.name),
+        reverse=True,
+    )
+
+    for checkpoint_path in checkpoint_paths[keep_latest_k:]:
+        try:
+            checkpoint_path.unlink()
+            print(f"Removed old step checkpoint: {checkpoint_path}")
+        except OSError as exc:
+            print(f"Warning: failed to remove old step checkpoint {checkpoint_path}: {exc}")
+
+
 def load_checkpoint(
     checkpoint_path: str,
     model: torch.nn.Module,
@@ -649,6 +667,10 @@ def main():
                         help='Path to checkpoint to resume from')
     parser.add_argument('--checkpoint_interval_hours', type=float, default=2.8,
                         help='Save checkpoint every N hours (default: 2.8)')
+    parser.add_argument('--checkpoint_interval_steps', type=int, default=0,
+                        help='Save a periodic checkpoint every N optimizer steps without exiting (0 disables)')
+    parser.add_argument('--checkpoint_keep_latest_k', type=int, default=2,
+                        help='Keep only the latest K periodic step checkpoints; negative keeps all')
     parser.add_argument('--save_final_checkpoint', action='store_true', default=True,
                         help='Save final checkpoint at end of training')
     parser.add_argument('--save_best_checkpoint', action='store_true', default=False,
@@ -663,6 +685,8 @@ def main():
     args.warmup_steps = int(args.warmup_ratio * args.lr_schedule_steps)
     if args.min_lr_factor < 0:
         raise ValueError("--min_lr_factor must be non-negative")
+    if args.checkpoint_interval_steps < 0:
+        raise ValueError("--checkpoint_interval_steps must be non-negative")
 
     # Validate Muon optimizer availability
     if args.optimizer == 'muon' and not MUON_AVAILABLE:
@@ -1283,6 +1307,8 @@ def main():
         print(f"\nCheckpointing configuration:")
         print(f"  Checkpoint directory: {args.checkpoint_dir}")
         print(f"  Checkpoint interval: {args.checkpoint_interval_hours} hours ({checkpoint_interval_seconds/60:.1f} minutes)")
+        print(f"  Periodic step checkpoint interval: {args.checkpoint_interval_steps if args.checkpoint_interval_steps else 'disabled'}")
+        print(f"  Keep latest periodic step checkpoints: {args.checkpoint_keep_latest_k if args.checkpoint_keep_latest_k >= 0 else 'all'}")
         print(f"  Save final checkpoint: {args.save_final_checkpoint}")
         print(f"  Save best checkpoint: {args.save_best_checkpoint}")
         if args.resume_from:
@@ -1712,6 +1738,38 @@ def main():
                 print(f"Step {step}, Rank {rank}: Loss={avg_train_loss:.4f}, LR={lr:.6f}")
 
             model.train()
+            dist.barrier()
+
+        if args.checkpoint_interval_steps > 0 and (step + 1) % args.checkpoint_interval_steps == 0:
+            if rank == 0:
+                print(f"\n{'='*80}")
+                print(
+                    "Saving periodic step checkpoint "
+                    f"after {step + 1} completed optimizer steps"
+                )
+                print(f"{'='*80}\n")
+
+                save_checkpoint(
+                    checkpoint_dir=args.checkpoint_dir,
+                    model=model,
+                    model_args=model_args,
+                    shared_optimizer=shared_optimizer,
+                    private_optimizers=private_optimizers,
+                    private_param_store=private_param_store,
+                    scheduler=scheduler,
+                    step=step,
+                    total_tokens_rank0=total_tokens_rank0,
+                    total_tokens_world=total_tokens_world,
+                    total_flops=total_flops,
+                    total_flops_forward=total_flops_forward,
+                    total_flops_backward=total_flops_backward,
+                    args=args,
+                    best_val_loss=best_val_loss,
+                    is_final=False,
+                    alpha_scheduler=alpha_scheduler
+                )
+                prune_step_checkpoints(args.checkpoint_dir, args.checkpoint_keep_latest_k)
+
             dist.barrier()
 
         # Check if it's time to save a checkpoint (every N hours)

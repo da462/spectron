@@ -106,6 +106,8 @@ MICRO_BATCH_SIZE="\${MICRO_BATCH_SIZE:-16}"
 LOG_INTERVAL="\${LOG_INTERVAL:-10}"
 MAX_VAL_SAMPLES="\${MAX_VAL_SAMPLES:-100}"
 CHECKPOINT_INTERVAL_HOURS="\${CHECKPOINT_INTERVAL_HOURS:-2.8}"
+CHECKPOINT_INTERVAL_STEPS="\${CHECKPOINT_INTERVAL_STEPS:-500}"
+CHECKPOINT_KEEP_LATEST_K="\${CHECKPOINT_KEEP_LATEST_K:-2}"
 MAX_LR="\${MAX_LR:-$SUBMIT_MAX_LR}"
 LR_TAG="\${MAX_LR//./p}"
 LR_TAG="\${LR_TAG//-}"
@@ -149,6 +151,7 @@ echo "  run_mode=\$RUN_MODE rope_theta=10000 seq_len=2048 total_steps=\$TOTAL_ST
 echo "  lr=\$MAX_LR weight_decay=0.1 batch=\$GLOBAL_BATCH_SIZE micro_batch=\$MICRO_BATCH_SIZE"
 echo "  data_root=\$DATA_ROOT"
 echo "  run_name=\$RUN_NAME"
+echo "  checkpoint_interval_steps=\$CHECKPOINT_INTERVAL_STEPS checkpoint_keep_latest_k=\$CHECKPOINT_KEEP_LATEST_K"
 echo "  wandb_mode=\$WANDB_MODE"
 echo "  wandb_dir=\$WANDB_DIR"
 
@@ -182,6 +185,8 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" simple_gpt_training.py \\
   --virtual_workers_per_gpu 1 \\
   --max_val_samples "\$MAX_VAL_SAMPLES" \\
   --checkpoint_interval_hours "\$CHECKPOINT_INTERVAL_HOURS" \\
+  --checkpoint_interval_steps "\$CHECKPOINT_INTERVAL_STEPS" \\
+  --checkpoint_keep_latest_k "\$CHECKPOINT_KEEP_LATEST_K" \\
   --train_files "\$DATA_ROOT/fineweb_train_*.bin" \\
   --val_files "\$DATA_ROOT/fineweb_val_*.bin" \\
   --checkpoint_dir "\$CHECKPOINT_ROOT/\$RUN_NAME" \\
