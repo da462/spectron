@@ -99,14 +99,14 @@ CHECKPOINT_ROOT="\${CHECKPOINT_ROOT:-/lustre/fswork/projects/rech/qps/ulf36rc/sp
 WANDB_PROJECT="\${WANDB_PROJECT:-spectron_attnrank}"
 WANDB_ENTITY="\${WANDB_ENTITY:-da462}"
 WANDB_DIR="\${WANDB_DIR:-\$CHECKPOINT_ROOT/wandb_offline}"
-TOTAL_STEPS="\${TOTAL_STEPS:-500}"
-LR_SCHEDULE_STEPS="\${LR_SCHEDULE_STEPS:-2555}"
+TOTAL_STEPS="\${TOTAL_STEPS:-$JOB_STEPS}"
+LR_SCHEDULE_STEPS="\${LR_SCHEDULE_STEPS:-$JOB_SCHEDULE_STEPS}"
 GLOBAL_BATCH_SIZE="\${GLOBAL_BATCH_SIZE:-512}"
 MICRO_BATCH_SIZE="\${MICRO_BATCH_SIZE:-16}"
 LOG_INTERVAL="\${LOG_INTERVAL:-10}"
 MAX_VAL_SAMPLES="\${MAX_VAL_SAMPLES:-100}"
 CHECKPOINT_INTERVAL_HOURS="\${CHECKPOINT_INTERVAL_HOURS:-2.8}"
-MAX_LR="\${MAX_LR:-5e-3}"
+MAX_LR="\${MAX_LR:-$SUBMIT_MAX_LR}"
 LR_TAG="\${MAX_LR//./p}"
 LR_TAG="\${LR_TAG//-}"
 RUN_NAME="\${RUN_NAME:-spectron_tt134m_fineweb_adamw_lr\${LR_TAG}_wd0p1_seq2048_steps\${TOTAL_STEPS}_sched\${LR_SCHEDULE_STEPS}_rope10000_\${RUN_MODE}}"
@@ -191,7 +191,7 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" simple_gpt_training.py \\
   "\${LOW_RANK_FLAGS[@]}"
 EOF
 
-if [[ "\${DRY_RUN:-0}" == "1" ]]; then
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
   echo "Prepared $JOB_SCRIPT"
   echo "DRY_RUN=1 set, not submitting."
 else
