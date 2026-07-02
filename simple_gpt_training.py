@@ -1350,7 +1350,12 @@ def main():
                     batch = next(virtual_train_iterators[vw])
                 except StopIteration:
                     # Recreate iterator if exhausted
-                    train_loader_vw, _ = create_dataloaders(args, vw, virtual_world_size, device=f"cuda:{local_rank}")
+                    train_loader_vw, _ = create_dataloaders(
+                        args,
+                        vw,
+                        virtual_world_size,
+                        device=dataset_device,
+                    )
                     virtual_train_iterators[vw] = iter(train_loader_vw)
                     batch = next(virtual_train_iterators[vw])
 
