@@ -16,6 +16,15 @@ JOB_NAME="spectron_tt134m_${RUN_MODE}_steps${JOB_STEPS}_sched${JOB_SCHEDULE_STEP
 JOB_SCRIPT="$JOB_DIR/${JOB_NAME}_${PROFILE}_${RUN_STAMP}.slurm"
 
 case "$PROFILE" in
+  h100_4_dev2h_cpu30_whj)
+    ACCOUNT="whj@h100"
+    PARTITION="gpu_p6"
+    QOS="qos_gpu_h100-dev"
+    CONSTRAINT="h100"
+    GPUS=4
+    CPUS_PER_TASK=30
+    TIME_LIMIT="02:00:00"
+    ;;
   h100_4_dev2h_cpu30_qps)
     ACCOUNT="qps@h100"
     PARTITION="gpu_p6"
@@ -35,7 +44,7 @@ case "$PROFILE" in
     TIME_LIMIT="00:20:00"
     ;;
   *)
-    echo "Unknown PROFILE '$PROFILE'. Use h100_4_dev2h_cpu30_qps or a100_dev_20m." >&2
+    echo "Unknown PROFILE '$PROFILE'. Use h100_4_dev2h_cpu30_whj, h100_4_dev2h_cpu30_qps, or a100_dev_20m." >&2
     exit 2
     ;;
 esac
@@ -86,6 +95,7 @@ DATA_ROOT="\${DATA_ROOT:-/lustre/fswork/projects/rech/qps/ulf36rc/spectron_data/
 CHECKPOINT_ROOT="\${CHECKPOINT_ROOT:-/lustre/fswork/projects/rech/qps/ulf36rc/spectron_checkpoints}"
 WANDB_PROJECT="\${WANDB_PROJECT:-spectron_attnrank}"
 WANDB_ENTITY="\${WANDB_ENTITY:-da462}"
+WANDB_DIR="\${WANDB_DIR:-\$CHECKPOINT_ROOT/wandb_offline}"
 TOTAL_STEPS="\${TOTAL_STEPS:-500}"
 LR_SCHEDULE_STEPS="\${LR_SCHEDULE_STEPS:-2555}"
 GLOBAL_BATCH_SIZE="\${GLOBAL_BATCH_SIZE:-512}"
@@ -93,7 +103,12 @@ MICRO_BATCH_SIZE="\${MICRO_BATCH_SIZE:-16}"
 LOG_INTERVAL="\${LOG_INTERVAL:-10}"
 MAX_VAL_SAMPLES="\${MAX_VAL_SAMPLES:-100}"
 CHECKPOINT_INTERVAL_HOURS="\${CHECKPOINT_INTERVAL_HOURS:-2.8}"
-RUN_NAME="\${RUN_NAME:-spectron_tt134m_fineweb_adamw_lr5e3_wd0p1_seq2048_steps\${TOTAL_STEPS}_sched\${LR_SCHEDULE_STEPS}_rope10000_\${RUN_MODE}}"
+MAX_LR="\${MAX_LR:-5e-3}"
+LR_TAG="\${MAX_LR//./p}"
+LR_TAG="\${LR_TAG//-}"
+RUN_NAME="\${RUN_NAME:-spectron_tt134m_fineweb_adamw_lr\${LR_TAG}_wd0p1_seq2048_steps\${TOTAL_STEPS}_sched\${LR_SCHEDULE_STEPS}_rope10000_\${RUN_MODE}}"
+mkdir -p "\$WANDB_DIR"
+export WANDB_DIR
 
 LOW_RANK_FLAGS=()
 case "\$RUN_MODE" in
@@ -128,10 +143,11 @@ esac
 echo "Spectron TT-matched AdamW run"
 echo "  model_size=134m hidden=768 layers=12 heads=12"
 echo "  run_mode=\$RUN_MODE rope_theta=10000 seq_len=2048 total_steps=\$TOTAL_STEPS lr_schedule_steps=\$LR_SCHEDULE_STEPS"
-echo "  lr=5e-3 weight_decay=0.1 batch=\$GLOBAL_BATCH_SIZE micro_batch=\$MICRO_BATCH_SIZE"
+echo "  lr=\$MAX_LR weight_decay=0.1 batch=\$GLOBAL_BATCH_SIZE micro_batch=\$MICRO_BATCH_SIZE"
 echo "  data_root=\$DATA_ROOT"
 echo "  run_name=\$RUN_NAME"
 echo "  wandb_mode=\$WANDB_MODE"
+echo "  wandb_dir=\$WANDB_DIR"
 
 exec torchrun --nproc_per_node="\$NPROC_PER_NODE" simple_gpt_training.py \\
   --seed 1234 \\
@@ -146,7 +162,7 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" simple_gpt_training.py \\
   --multiple_of 256 \\
   --rope_theta 10000 \\
   --optimizer adamw \\
-  --max_lr 5e-3 \\
+  --max_lr "\$MAX_LR" \\
   --weight_decay 0.1 \\
   --adam_beta1 0.9 \\
   --adam_beta2 0.95 \\
@@ -172,5 +188,10 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" simple_gpt_training.py \\
   "\${LOW_RANK_FLAGS[@]}"
 EOF
 
-echo "Submitting $JOB_SCRIPT"
-sbatch "$JOB_SCRIPT"
+if [[ "\${DRY_RUN:-0}" == "1" ]]; then
+  echo "Prepared $JOB_SCRIPT"
+  echo "DRY_RUN=1 set, not submitting."
+else
+  echo "Submitting $JOB_SCRIPT"
+  sbatch "$JOB_SCRIPT"
+fi
