@@ -1,12 +1,13 @@
-import torch
 import argparse
+import math
+import torch
 from titan_gpt import TitanGPT, TitanModelArgs
 from low_rank_linear import replace_linear_with_lowrank
 
 
 def calculate_transformer_flops(batch_size, seq_len, vocab_size, hidden_size, num_layers, num_heads,
                                ffn_hidden_size=None, use_low_rank=False, rank_ratio=0.25,
-                               exclude_modules=None, disable_c=False):
+                               exclude_modules=None, disable_c=False, n_kv_heads=None):
     """
     Manually calculate FLOPs for a transformer model forward pass.
 
@@ -16,12 +17,13 @@ def calculate_transformer_flops(batch_size, seq_len, vocab_size, hidden_size, nu
         vocab_size: Vocabulary size
         hidden_size: Hidden dimension size
         num_layers: Number of transformer layers
-        num_heads: Number of attention heads
+        num_heads: Number of query attention heads
         ffn_hidden_size: FFN intermediate size (defaults to 4 * hidden_size)
         use_low_rank: Whether low-rank decomposition is used
         rank_ratio: Rank ratio for low-rank decomposition
         exclude_modules: List of module names excluded from low-rank decomposition
         disable_c: Whether C matrix is disabled in ACB factorization (uses AB instead)
+        n_kv_heads: Number of key/value heads (defaults to num_heads)
 
     Returns:
         forward_flops: FLOPs for forward pass
@@ -31,11 +33,18 @@ def calculate_transformer_flops(batch_size, seq_len, vocab_size, hidden_size, nu
 
     if exclude_modules is None:
         exclude_modules = []
+    if n_kv_heads is None:
+        n_kv_heads = num_heads
 
-    def linear_flops(in_features, out_features, batch_tokens, is_low_rank=False, apply_low_rank=True):
+    def module_uses_low_rank(module_name):
+        if not use_low_rank:
+            return False
+        return not any(exclude in module_name for exclude in exclude_modules)
+
+    def linear_flops(module_name, in_features, out_features, batch_tokens):
         """Calculate FLOPs for a linear layer: y = x @ W^T where x is (batch_tokens, in_features), W is (out_features, in_features)"""
-        if is_low_rank and apply_low_rank:
-            rank = int(rank_ratio * in_features)
+        if module_uses_low_rank(module_name):
+            rank = max(1, int(rank_ratio * in_features))
             if disable_c:
                 # AB factorization: W = A @ B
                 # x @ (A @ B)^T = x @ B^T @ A^T
@@ -58,37 +67,39 @@ def calculate_transformer_flops(batch_size, seq_len, vocab_size, hidden_size, nu
     batch_tokens = batch_size * seq_len
 
     # Embedding lookup (no FLOPs, just memory access)
-
-    # Check if output layer is excluded from low-rank
-    output_is_low_rank = 'output' not in exclude_modules
+    head_dim = hidden_size // num_heads
+    q_out_features = num_heads * head_dim
+    kv_out_features = n_kv_heads * head_dim
 
     # Per-layer calculations
     for _ in range(num_layers):
-        # 1. Attention QKV projections: 3 linear layers (hidden_size -> hidden_size)
-        flops += 3 * linear_flops(hidden_size, hidden_size, batch_tokens, use_low_rank, True)
+        # 1. Attention projections.
+        flops += linear_flops("attention.wq", hidden_size, q_out_features, batch_tokens)
+        flops += linear_flops("attention.wk", hidden_size, kv_out_features, batch_tokens)
+        flops += linear_flops("attention.wv", hidden_size, kv_out_features, batch_tokens)
 
         # 2. Attention scores: Q @ K^T
         # (batch_size, num_heads, seq_len, head_dim) @ (batch_size, num_heads, head_dim, seq_len)
-        head_dim = hidden_size // num_heads
         flops += batch_size * num_heads * seq_len * seq_len * head_dim * 2
 
         # 3. Attention softmax: ~5 ops per element
         # flops += batch_size * num_heads * seq_len * seq_len * 5
 
         # 4. Attention weighted sum: softmax @ V
-        # flops += batch_size * num_heads * seq_len * seq_len * head_dim * 2
+        flops += batch_size * num_heads * seq_len * seq_len * head_dim * 2
 
         # 5. Attention output projection: (hidden_size -> hidden_size)
-        flops += linear_flops(hidden_size, hidden_size, batch_tokens, use_low_rank, True)
+        flops += linear_flops("attention.wo", q_out_features, hidden_size, batch_tokens)
 
-        # 6. FFN first layer: (hidden_size -> ffn_hidden_size)
-        flops += linear_flops(hidden_size, ffn_hidden_size, batch_tokens, use_low_rank, True)
+        # 6. SwiGLU FFN projections: W1 and W3 up, W2 down.
+        flops += linear_flops("feed_forward.w1", hidden_size, ffn_hidden_size, batch_tokens)
+        flops += linear_flops("feed_forward.w3", hidden_size, ffn_hidden_size, batch_tokens)
 
         # 7. FFN activation (SwiGLU or GeLU): ~8 ops per element
         # flops += batch_tokens * ffn_hidden_size * 8
 
-        # 8. FFN second layer: (ffn_hidden_size -> hidden_size)
-        flops += linear_flops(ffn_hidden_size, hidden_size, batch_tokens, use_low_rank, True)
+        # 8. FFN down projection: (ffn_hidden_size -> hidden_size)
+        flops += linear_flops("feed_forward.w2", ffn_hidden_size, hidden_size, batch_tokens)
 
         # 9. Layer norms: ~5 ops per element (mean, variance, normalize, scale, shift)
         # Two layer norms per transformer layer
@@ -98,7 +109,7 @@ def calculate_transformer_flops(batch_size, seq_len, vocab_size, hidden_size, nu
     # flops += batch_tokens * hidden_size * 5
 
     # Output projection: (hidden_size -> vocab_size)
-    # flops += linear_flops(hidden_size, vocab_size, batch_tokens, use_low_rank, output_is_low_rank)
+    flops += linear_flops("output", hidden_size, vocab_size, batch_tokens)
 
     # # Cross-entropy loss: softmax (~5 ops) + log (~3 ops) per element
     # flops += batch_tokens * vocab_size * 8
@@ -228,6 +239,12 @@ def main():
     # FLOP calculation config
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size for FLOP calculation')
     parser.add_argument('--seq_len', type=int, default=1024, help='Sequence length for FLOP calculation')
+    parser.add_argument(
+        '--flop_match_steps',
+        type=int,
+        default=None,
+        help='Dense full-rank step budget to match when reporting low-rank equivalent steps',
+    )
 
     args = parser.parse_args()
 
@@ -353,7 +370,8 @@ def main():
         use_low_rank=args.low_rank,
         rank_ratio=args.low_rank_ratio if args.low_rank else 0.25,
         exclude_modules=args.exclude_modules if args.low_rank else [],
-        disable_c=args.disable_c if args.low_rank else False
+        disable_c=args.disable_c if args.low_rank else False,
+        n_kv_heads=args.n_kv_heads,
     )
 
     # Estimate backward pass as 2x forward pass
@@ -374,7 +392,7 @@ def main():
     # Calculate ratio of forward FLOPs to non-embedding parameters
     flops_per_param_ratio = flops_per_step_forward / (current_non_embedding_params * args.batch_size * args.seq_len)
 
-    print(f"Non-Embedding Forward FLOPs per batch: {tflops_forward:.3f} TFLOPs ({flops_per_step_forward:,})")
+    print(f"Forward FLOPs per batch: {tflops_forward:.3f} TFLOPs ({flops_per_step_forward:,})")
     print(f"Estimated Backward FLOPs per batch: {tflops_backward:.3f} TFLOPs ({flops_per_step_backward:,})")
     print(f"Total FLOPs per batch: {tflops_total:.3f} TFLOPs ({flops_per_step_total:,})")
     print()
@@ -396,12 +414,20 @@ def main():
         print(f"  Full-rank parameters: {original_params:,} ({original_params/1e6:.2f}M)")
         print(f"  Full-rank non-embedding parameters: {original_non_embedding_params:,} ({original_non_embedding_params/1e6:.2f}M)")
 
-        # Chinchilla optimal for full-rank model: 20 * full_rank_non_embedding_params
-        optimal_tokens_full = 20 * original_non_embedding_params
-        optimal_steps_full = int(optimal_tokens_full / tokens_per_step)
+        if args.flop_match_steps is not None:
+            optimal_tokens_full = args.flop_match_steps * tokens_per_step
+            optimal_steps_full = args.flop_match_steps
+        else:
+            # Chinchilla optimal for full-rank model: 20 * full_rank_non_embedding_params
+            optimal_tokens_full = 20 * original_non_embedding_params
+            optimal_steps_full = int(optimal_tokens_full / tokens_per_step)
 
-        print(f"  Chinchilla optimal tokens: {optimal_tokens_full:,} ({optimal_tokens_full/1e9:.2f}B)")
-        print(f"  Optimal training steps: {optimal_steps_full:,}")
+        if args.flop_match_steps is not None:
+            print(f"  Full-rank reference tokens: {optimal_tokens_full:,} ({optimal_tokens_full/1e9:.2f}B)")
+            print(f"  Full-rank reference steps: {optimal_steps_full:,}")
+        else:
+            print(f"  Chinchilla optimal tokens: {optimal_tokens_full:,} ({optimal_tokens_full/1e9:.2f}B)")
+            print(f"  Optimal training steps: {optimal_steps_full:,}")
         print()
 
         # Calculate full-rank FLOPs
@@ -416,18 +442,28 @@ def main():
             use_low_rank=False,  # Full-rank
             rank_ratio=0.25,
             exclude_modules=[],
-            disable_c=False
+            disable_c=False,
+            n_kv_heads=args.n_kv_heads,
         )
         flops_per_step_full_total = flops_per_step_full_forward * 3  # forward + 2x backward
 
         # Calculate full-rank FLOPs/param ratio
-        flops_per_param_ratio_full = flops_per_step_full_forward / original_non_embedding_params
+        flops_per_param_ratio_full = flops_per_step_full_forward / (
+            original_non_embedding_params * args.batch_size * args.seq_len
+        )
 
         # Total FLOPs for full-rank Chinchilla optimal training
         total_flops_full_training = flops_per_step_full_total * optimal_steps_full
 
         # Calculate equivalent steps for low-rank model with same compute budget
-        equivalent_steps_low_rank = int(total_flops_full_training / flops_per_step_total)
+        equivalent_steps_low_rank_exact = total_flops_full_training / flops_per_step_total
+        equivalent_steps_low_rank_floor = math.floor(equivalent_steps_low_rank_exact)
+        equivalent_steps_low_rank_ceil = math.ceil(equivalent_steps_low_rank_exact)
+        equivalent_steps_low_rank = equivalent_steps_low_rank_ceil
+        matched_flops_integer = equivalent_steps_low_rank * flops_per_step_total
+        integer_match_error = (
+            matched_flops_integer - total_flops_full_training
+        ) / total_flops_full_training
 
         print("FLOP-Matched Training (Low-Rank Model):")
         print(f"  Full-rank FLOPs per step: {flops_per_step_full_total/1e12:.3f} TFLOPs")
@@ -435,7 +471,10 @@ def main():
         print(f"  Total FLOPs for full-rank optimal training: {total_flops_full_training/1e12:.2f} TFLOPs")
         print(f"  Low-rank FLOPs per step: {flops_per_step_total/1e12:.3f} TFLOPs")
         print(f"  Low-rank Forward FLOPs / Non-embedding Params: {flops_per_param_ratio:.2f}")
-        print(f"  Equivalent low-rank training steps: {equivalent_steps_low_rank:,}")
+        print(f"  Equivalent low-rank training steps exact: {equivalent_steps_low_rank_exact:,.6f}")
+        print(f"  Equivalent low-rank training steps floor/ceil: {equivalent_steps_low_rank_floor:,} / {equivalent_steps_low_rank_ceil:,}")
+        print(f"  Recommended integer low-rank steps: {equivalent_steps_low_rank:,}")
+        print(f"  Integer-step FLOP match error: {integer_match_error:+.4%}")
 
         # Calculate speedup
         speedup = equivalent_steps_low_rank / optimal_steps_full
@@ -474,17 +513,23 @@ def main():
         print(f"  Original Non-Embedding: {original_non_embedding_params/1e6:.2f}M")
         print(f"  Total Reduction: {reduction:.1f}%")
         print(f"  Non-Embedding Reduction: {non_embedding_reduction:.1f}%")
-    print(f"Non-Embedding FLOPs per batch (bs={args.batch_size}, seq_len={args.seq_len}): {tflops_total:.3f} TFLOPs")
+    print(f"FLOPs per batch (bs={args.batch_size}, seq_len={args.seq_len}): {tflops_total:.3f} TFLOPs")
     print(f"  Forward: {tflops_forward:.3f} TFLOPs")
     print(f"  Backward: {tflops_backward:.3f} TFLOPs")
     print(f"  Forward FLOPs / Non-Embedding Params: {flops_per_param_ratio:.2f}")
 
     if args.low_rank:
-        print(f"Chinchilla Optimal Training (Full-Rank Model, Non-Embedding):")
-        print(f"  Total tokens: {optimal_tokens_full/1e9:.2f}B")
-        print(f"  Training steps: {optimal_steps_full:,}")
+        if args.flop_match_steps is not None:
+            print(f"Full-Rank Reference Training:")
+            print(f"  Total tokens: {optimal_tokens_full/1e9:.2f}B")
+            print(f"  Training steps: {optimal_steps_full:,}")
+        else:
+            print(f"Chinchilla Optimal Training (Full-Rank Model, Non-Embedding):")
+            print(f"  Total tokens: {optimal_tokens_full/1e9:.2f}B")
+            print(f"  Training steps: {optimal_steps_full:,}")
         print(f"FLOP-Matched Training (Low-Rank Model):")
-        print(f"  Equivalent training steps: {equivalent_steps_low_rank:,}")
+        print(f"  Equivalent training steps exact: {equivalent_steps_low_rank_exact:,.6f}")
+        print(f"  Recommended integer training steps: {equivalent_steps_low_rank:,}")
         print(f"  Speedup: {speedup:.2f}x")
     else:
         print(f"Chinchilla Optimal Training (Non-Embedding):")

@@ -1204,7 +1204,8 @@ def main():
             use_low_rank=args.low_rank,
             rank_ratio=args.low_rank_ratio if args.low_rank else 0.25,
             exclude_modules=args.exclude_modules if args.low_rank else [],
-            disable_c=args.disable_c if args.low_rank else False
+            disable_c=args.disable_c if args.low_rank else False,
+            n_kv_heads=args.n_kv_heads,
         )
 
         # Estimate backward pass as 2x forward pass
