@@ -13,9 +13,12 @@ RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 JOB_STEPS="${TOTAL_STEPS:-500}"
 JOB_SCHEDULE_STEPS="${LR_SCHEDULE_STEPS:-2555}"
 SUBMIT_MAX_LR="${MAX_LR:-5e-3}"
+SUBMIT_OPTIMIZER="${OPTIMIZER:-adamw}"
 SUBMIT_LR_TAG="${SUBMIT_MAX_LR//./p}"
-SUBMIT_LR_TAG="${SUBMIT_LR_TAG//-}"
-JOB_NAME="spectron_tt134m_${RUN_MODE}_lr${SUBMIT_LR_TAG}_steps${JOB_STEPS}_sched${JOB_SCHEDULE_STEPS}"
+SUBMIT_LR_TAG="${SUBMIT_LR_TAG//e-/em}"
+SUBMIT_LR_TAG="${SUBMIT_LR_TAG//e+/ep}"
+SUBMIT_LR_TAG="${SUBMIT_LR_TAG//-/m}"
+JOB_NAME="spectron_tt134m_${SUBMIT_OPTIMIZER}_${RUN_MODE}_lr${SUBMIT_LR_TAG}_steps${JOB_STEPS}_sched${JOB_SCHEDULE_STEPS}"
 JOB_SCRIPT="$JOB_DIR/${JOB_NAME}_${PROFILE}_${RUN_STAMP}.slurm"
 
 case "$PROFILE" in
@@ -57,6 +60,15 @@ case "$RUN_MODE" in
     ;;
   *)
     echo "Unknown RUN_MODE '$RUN_MODE'. Use fullrank, lowrank_all, lowrank_attention, or lowrank_ffn." >&2
+    exit 2
+    ;;
+esac
+
+case "$SUBMIT_OPTIMIZER" in
+  adamw|muon)
+    ;;
+  *)
+    echo "Unknown OPTIMIZER '$SUBMIT_OPTIMIZER'. Use adamw or muon." >&2
     exit 2
     ;;
 esac
@@ -110,11 +122,14 @@ CHECKPOINT_INTERVAL_HOURS="\${CHECKPOINT_INTERVAL_HOURS:-2.8}"
 CHECKPOINT_INTERVAL_STEPS="\${CHECKPOINT_INTERVAL_STEPS:-500}"
 CHECKPOINT_KEEP_LATEST_K="\${CHECKPOINT_KEEP_LATEST_K:-2}"
 MAX_LR="\${MAX_LR:-$SUBMIT_MAX_LR}"
+OPTIMIZER="\${OPTIMIZER:-$SUBMIT_OPTIMIZER}"
 WARMUP_START_FACTOR="\${WARMUP_START_FACTOR:-0.0}"
 SKIP_FINAL_EVAL="\${SKIP_FINAL_EVAL:-1}"
 LR_TAG="\${MAX_LR//./p}"
-LR_TAG="\${LR_TAG//-}"
-RUN_NAME="\${RUN_NAME:-spectron_tt134m_fineweb_adamw_lr\${LR_TAG}_wd0p1_seq2048_steps\${TOTAL_STEPS}_sched\${LR_SCHEDULE_STEPS}_rope10000_\${RUN_MODE}}"
+LR_TAG="\${LR_TAG//e-/em}"
+LR_TAG="\${LR_TAG//e+/ep}"
+LR_TAG="\${LR_TAG//-/m}"
+RUN_NAME="\${RUN_NAME:-spectron_tt134m_fineweb_\${OPTIMIZER}_lr\${LR_TAG}_wd0p1_seq2048_steps\${TOTAL_STEPS}_sched\${LR_SCHEDULE_STEPS}_rope10000_\${RUN_MODE}}"
 mkdir -p "\$WANDB_DIR"
 export WANDB_DIR
 
@@ -153,9 +168,9 @@ if [[ "\$SKIP_FINAL_EVAL" == "1" ]]; then
   FINAL_EVAL_FLAGS=(--skip_final_eval)
 fi
 
-echo "Spectron TT-matched AdamW run"
+echo "Spectron TT-matched run"
 echo "  model_size=134m hidden=768 layers=12 heads=12"
-echo "  run_mode=\$RUN_MODE rope_theta=10000 seq_len=2048 total_steps=\$TOTAL_STEPS lr_schedule_steps=\$LR_SCHEDULE_STEPS"
+echo "  optimizer=\$OPTIMIZER run_mode=\$RUN_MODE rope_theta=10000 seq_len=2048 total_steps=\$TOTAL_STEPS lr_schedule_steps=\$LR_SCHEDULE_STEPS"
 echo "  lr=\$MAX_LR warmup_start_factor=\$WARMUP_START_FACTOR weight_decay=0.1 batch=\$GLOBAL_BATCH_SIZE micro_batch=\$MICRO_BATCH_SIZE"
 echo "  log_interval=\$LOG_INTERVAL eval_interval=\$EVAL_INTERVAL skip_final_eval=\$SKIP_FINAL_EVAL"
 echo "  data_root=\$DATA_ROOT"
@@ -176,7 +191,7 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" simple_gpt_training.py \\
   --val_seq_len 2048 \\
   --multiple_of 256 \\
   --rope_theta 10000 \\
-  --optimizer adamw \\
+  --optimizer "\$OPTIMIZER" \\
   --max_lr "\$MAX_LR" \\
   --weight_decay 0.1 \\
   --adam_beta1 0.9 \\
