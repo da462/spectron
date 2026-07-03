@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROFILE="${1:-h100_4_dev2h_cpu30_qps}"
+PROFILE="${1:-h100_4_dev2h_cpu30_whj}"
 RUN_MODE="${2:-lowrank_all}"
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
