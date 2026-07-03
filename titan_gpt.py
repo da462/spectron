@@ -163,6 +163,46 @@ class TitanGPT(nn.Module):
         self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
         self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=False)
+        if model_args.depth_init:
+            self._apply_torchtitan_llama3_init()
+
+    @staticmethod
+    def _depth_scaled_std(base_std: float, layer_id: int) -> float:
+        return base_std / (2 * (layer_id + 1)) ** 0.5
+
+    @staticmethod
+    def _init_linear(module: nn.Linear, std: float) -> None:
+        nn.init.trunc_normal_(module.weight, std=std)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+    def _apply_torchtitan_llama3_init(self) -> None:
+        """Match TorchTitan Llama3 init for this unfused Spectron model."""
+        nn.init.normal_(self.tok_embeddings.weight, std=1.0)
+        nn.init.ones_(self.norm.weight)
+        output_std = self.model_args.dim**-0.5
+        nn.init.trunc_normal_(
+            self.output.weight,
+            std=output_std,
+            a=-3 * output_std,
+            b=3 * output_std,
+        )
+
+        for layer_id, layer in enumerate(self.layers.values()):
+            nn.init.ones_(layer.attention_norm.weight)
+            nn.init.ones_(layer.ffn_norm.weight)
+
+            self._init_linear(layer.attention.wq, 0.02)
+            self._init_linear(layer.attention.wk, 0.02)
+            self._init_linear(layer.attention.wv, 0.02)
+            self._init_linear(
+                layer.attention.wo, self._depth_scaled_std(0.02, layer_id)
+            )
+
+            self._init_linear(layer.feed_forward.w1, 0.02)
+            residual_std = self._depth_scaled_std(0.02, layer_id)
+            self._init_linear(layer.feed_forward.w2, residual_std)
+            self._init_linear(layer.feed_forward.w3, residual_std)
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
         return precompute_freqs_cis(

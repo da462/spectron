@@ -611,6 +611,11 @@ def main():
     parser.add_argument('--multiple_of', type=int, default=256)
     parser.add_argument('--ffn_dim_multiplier', type=float, default=None)
     parser.add_argument('--rope_theta', type=float, default=10000.0)
+    parser.add_argument(
+        '--tt_style_init',
+        action='store_true',
+        help='Initialize weights with TorchTitan Llama3-style rules for ablations',
+    )
 
     # Subnet config
     parser.add_argument('--stochastic_depth', action='store_true')
@@ -761,8 +766,11 @@ def main():
         multiple_of=args.multiple_of,
         ffn_dim_multiplier=args.ffn_dim_multiplier,
         rope_theta=args.rope_theta,
+        depth_init=args.tt_style_init,
     )
     model = TitanGPT(model_args).to(device)
+    if rank == 0 and args.tt_style_init:
+        print("Using TorchTitan Llama3-style initialization")
 
     # Apply low-rank decomposition if enabled
     if args.low_rank:
