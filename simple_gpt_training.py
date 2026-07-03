@@ -575,6 +575,8 @@ def main():
     parser.add_argument('--lr_schedule_steps', type=int, default=None,
                         help='Number of steps used to shape warmup/cosine LR schedule. Defaults to total_steps.')
     parser.add_argument('--warmup_ratio', type=float, default=0.05, help='Warmup ratio (warmup_steps = warmup_ratio * lr_schedule_steps)')
+    parser.add_argument('--warmup_start_factor', type=float, default=0.1,
+                        help='Initial warmup LR as a fraction of max_lr for AdamW cosine schedule')
     parser.add_argument('--seed', type=int, default=BASE_SEED, help='Base random seed for model init and data-worker RNGs')
     parser.add_argument('--log_interval', type=int, default=10)
     parser.add_argument('--max_val_samples', type=int, default=1000)  # Limit validation samples for faster eval
@@ -685,6 +687,8 @@ def main():
     args.warmup_steps = int(args.warmup_ratio * args.lr_schedule_steps)
     if args.min_lr_factor < 0:
         raise ValueError("--min_lr_factor must be non-negative")
+    if not 0.0 <= args.warmup_start_factor <= 1.0:
+        raise ValueError("--warmup_start_factor must be between 0 and 1")
     if args.checkpoint_interval_steps < 0:
         raise ValueError("--checkpoint_interval_steps must be non-negative")
 
@@ -1107,11 +1111,17 @@ def main():
             )
         else:
             # AdamW scheduler
-            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            def adamw_warmup_lambda(step):
+                if args.warmup_steps == 0:
+                    return 1.0
+                progress = min(step / args.warmup_steps, 1.0)
+                return args.warmup_start_factor + (
+                    1.0 - args.warmup_start_factor
+                ) * progress
+
+            warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
                 shared_optimizer,
-                start_factor=0.1,  # Start from 0.1
-                end_factor=1.0,    # End at max_lr
-                total_iters=args.warmup_steps,
+                lr_lambda=[adamw_warmup_lambda] * len(shared_optimizer.param_groups),
             )
             cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 shared_optimizer,

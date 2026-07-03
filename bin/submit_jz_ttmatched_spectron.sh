@@ -109,6 +109,7 @@ CHECKPOINT_INTERVAL_HOURS="\${CHECKPOINT_INTERVAL_HOURS:-2.8}"
 CHECKPOINT_INTERVAL_STEPS="\${CHECKPOINT_INTERVAL_STEPS:-500}"
 CHECKPOINT_KEEP_LATEST_K="\${CHECKPOINT_KEEP_LATEST_K:-2}"
 MAX_LR="\${MAX_LR:-$SUBMIT_MAX_LR}"
+WARMUP_START_FACTOR="\${WARMUP_START_FACTOR:-0.0}"
 LR_TAG="\${MAX_LR//./p}"
 LR_TAG="\${LR_TAG//-}"
 RUN_NAME="\${RUN_NAME:-spectron_tt134m_fineweb_adamw_lr\${LR_TAG}_wd0p1_seq2048_steps\${TOTAL_STEPS}_sched\${LR_SCHEDULE_STEPS}_rope10000_\${RUN_MODE}}"
@@ -148,7 +149,7 @@ esac
 echo "Spectron TT-matched AdamW run"
 echo "  model_size=134m hidden=768 layers=12 heads=12"
 echo "  run_mode=\$RUN_MODE rope_theta=10000 seq_len=2048 total_steps=\$TOTAL_STEPS lr_schedule_steps=\$LR_SCHEDULE_STEPS"
-echo "  lr=\$MAX_LR weight_decay=0.1 batch=\$GLOBAL_BATCH_SIZE micro_batch=\$MICRO_BATCH_SIZE"
+echo "  lr=\$MAX_LR warmup_start_factor=\$WARMUP_START_FACTOR weight_decay=0.1 batch=\$GLOBAL_BATCH_SIZE micro_batch=\$MICRO_BATCH_SIZE"
 echo "  data_root=\$DATA_ROOT"
 echo "  run_name=\$RUN_NAME"
 echo "  checkpoint_interval_steps=\$CHECKPOINT_INTERVAL_STEPS checkpoint_keep_latest_k=\$CHECKPOINT_KEEP_LATEST_K"
@@ -179,6 +180,7 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" simple_gpt_training.py \\
   --total_steps "\$TOTAL_STEPS" \\
   --lr_schedule_steps "\$LR_SCHEDULE_STEPS" \\
   --warmup_ratio 0.05 \\
+  --warmup_start_factor "\$WARMUP_START_FACTOR" \\
   --log_interval "\$LOG_INTERVAL" \\
   --use_flex_attn \\
   --bf16 \\
