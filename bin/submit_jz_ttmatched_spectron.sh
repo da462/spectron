@@ -40,6 +40,15 @@ case "$PROFILE" in
     CPUS_PER_TASK=30
     TIME_LIMIT="02:00:00"
     ;;
+  a100_4_dev2h_cpu30_whj)
+    ACCOUNT="whj@a100"
+    PARTITION="gpu_p5"
+    QOS="qos_gpu_a100-dev"
+    CONSTRAINT="a100"
+    GPUS=4
+    CPUS_PER_TASK=30
+    TIME_LIMIT="02:00:00"
+    ;;
   a100_dev_20m)
     ACCOUNT="qps@a100"
     PARTITION="gpu_p5"
@@ -50,7 +59,7 @@ case "$PROFILE" in
     TIME_LIMIT="00:20:00"
     ;;
   *)
-    echo "Unknown PROFILE '$PROFILE'. Use h100_4_dev2h_cpu30_whj, h100_4_dev2h_cpu30_qps, or a100_dev_20m." >&2
+    echo "Unknown PROFILE '$PROFILE'. Use h100_4_dev2h_cpu30_whj, h100_4_dev2h_cpu30_qps, a100_4_dev2h_cpu30_whj, or a100_dev_20m." >&2
     exit 2
     ;;
 esac
