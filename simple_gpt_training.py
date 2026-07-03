@@ -579,6 +579,10 @@ def main():
                         help='Initial warmup LR as a fraction of max_lr for AdamW cosine schedule')
     parser.add_argument('--seed', type=int, default=BASE_SEED, help='Base random seed for model init and data-worker RNGs')
     parser.add_argument('--log_interval', type=int, default=10)
+    parser.add_argument('--eval_interval', type=int, default=None,
+                        help='Evaluate every N steps. Defaults to log_interval. Set 0 to disable periodic evaluation.')
+    parser.add_argument('--skip_final_eval', action='store_true',
+                        help='Skip final validation evaluation at the end of training')
     parser.add_argument('--max_val_samples', type=int, default=1000)  # Limit validation samples for faster eval
 
     # Optimizer config
@@ -685,6 +689,12 @@ def main():
     if args.lr_schedule_steps <= 0:
         raise ValueError("--lr_schedule_steps must be positive")
     args.warmup_steps = int(args.warmup_ratio * args.lr_schedule_steps)
+    if args.eval_interval is None:
+        args.eval_interval = args.log_interval
+    if args.log_interval < 0:
+        raise ValueError("--log_interval must be non-negative")
+    if args.eval_interval < 0:
+        raise ValueError("--eval_interval must be non-negative")
     if args.min_lr_factor < 0:
         raise ValueError("--min_lr_factor must be non-negative")
     if not 0.0 <= args.warmup_start_factor <= 1.0:
@@ -1662,8 +1672,11 @@ def main():
 
             wandb.log(log_dict)
 
-        # Logging and evaluation
-        if step>0 and step % args.log_interval == 0:
+        # Logging and evaluation are separate: train loss can be printed every
+        # step without forcing validation.
+        should_log = args.log_interval > 0 and step % args.log_interval == 0
+        should_eval = args.eval_interval > 0 and step > 0 and step % args.eval_interval == 0
+        if should_log or should_eval:
             lr = shared_optimizer.param_groups[0]['lr']
 
             # Calculate the average loss for all ranks before printing
@@ -1677,83 +1690,94 @@ def main():
             last_log_time = current_time
             last_log_tokens = total_tokens_world
 
-            # Evaluation every log_interval steps
+            eval_results = None
             if rank == 0:
-                if args.stochastic_depth and args.stochastic_depth_mode in ['forward_skip', 'backward_nograd']:
-                    # Temporarily unmask rank 0 for evaluation (all layers active)
-                    model.set_mask_from_vector(torch.ones(args.num_layers, dtype=torch.int, device=device))
+                if should_eval:
+                    if args.stochastic_depth and args.stochastic_depth_mode in ['forward_skip', 'backward_nograd']:
+                        # Temporarily unmask rank 0 for evaluation (all layers active)
+                        model.set_mask_from_vector(torch.ones(args.num_layers, dtype=torch.int, device=device))
 
-                    eval_results = evaluate_model(model, validation_loader, criterion, device, args)
+                        eval_results = evaluate_model(model, validation_loader, criterion, device, args)
 
-                    # Restore original mask
-                    if args.stochastic_depth_mode == 'backward_nograd':
-                        model.set_mask_with_mode(original_mask, 'backward_nograd')
+                        # Restore original mask
+                        if args.stochastic_depth_mode == 'backward_nograd':
+                            model.set_mask_with_mode(original_mask, 'backward_nograd')
+                        else:
+                            model.set_mask_from_vector(original_mask)
                     else:
-                        model.set_mask_from_vector(original_mask)
-                else:
-                    # For 'backward_hook', no change is needed as hooks are not called in no_grad()
-                    eval_results = evaluate_model(model, validation_loader, criterion, device, args)
+                        # For 'backward_hook', no change is needed as hooks are not called in no_grad()
+                        eval_results = evaluate_model(model, validation_loader, criterion, device, args)
 
-                # Log validation metrics
-                wandb.log({
-                    'step': step,
-                    'val_loss': eval_results['val_loss'],
-                    'val_perplexity': eval_results['val_perplexity'],
-                    'val_token_accuracy': eval_results['val_token_accuracy'],
-                    'tokens_per_sec': tokens_per_sec,
-                })
+                    # Log validation metrics
+                    wandb.log({
+                        'step': step,
+                        'val_loss': eval_results['val_loss'],
+                        'val_perplexity': eval_results['val_perplexity'],
+                        'val_token_accuracy': eval_results['val_token_accuracy'],
+                        'tokens_per_sec': tokens_per_sec,
+                    })
 
-                # Update best validation loss
-                if eval_results['val_loss'] < best_val_loss:
-                    best_val_loss = eval_results['val_loss']
-                    try:
-                        wandb.summary['best_val_loss'] = best_val_loss
-                    except Exception as e:
-                        print(f"Warning: Failed to update wandb.summary['best_val_loss']: {e}")
-                    wandb.log({'best_val_loss': best_val_loss, 'step': step})
+                    # Update best validation loss
+                    if eval_results['val_loss'] < best_val_loss:
+                        best_val_loss = eval_results['val_loss']
+                        try:
+                            wandb.summary['best_val_loss'] = best_val_loss
+                        except Exception as e:
+                            print(f"Warning: Failed to update wandb.summary['best_val_loss']: {e}")
+                        wandb.log({'best_val_loss': best_val_loss, 'step': step})
 
-                    # Save best checkpoint (only if enabled)
-                    if args.save_best_checkpoint:
-                        print(f"\n{'='*80}")
-                        print(f"New best validation loss: {best_val_loss:.4f} at step {step}")
-                        print(f"Saving best checkpoint...")
-                        print(f"{'='*80}\n")
+                        # Save best checkpoint (only if enabled)
+                        if args.save_best_checkpoint:
+                            print(f"\n{'='*80}")
+                            print(f"New best validation loss: {best_val_loss:.4f} at step {step}")
+                            print(f"Saving best checkpoint...")
+                            print(f"{'='*80}\n")
 
-                        best_checkpoint_path = save_checkpoint(
-                            checkpoint_dir=args.checkpoint_dir,
-                            model=model,
-                            model_args=model_args,
-                            shared_optimizer=shared_optimizer,
-                            private_optimizers=private_optimizers,
-                            private_param_store=private_param_store,
-                            scheduler=scheduler,
-                            step=step,
-                            total_tokens_rank0=total_tokens_rank0,
-                            total_tokens_world=total_tokens_world,
-                            total_flops=total_flops,
-                            total_flops_forward=total_flops_forward,
-                            total_flops_backward=total_flops_backward,
-                            args=args,
-                            best_val_loss=best_val_loss,
-                            is_final=False,
-                            is_best=True,
-                            alpha_scheduler=alpha_scheduler
-                        )
-                    else:
+                            best_checkpoint_path = save_checkpoint(
+                                checkpoint_dir=args.checkpoint_dir,
+                                model=model,
+                                model_args=model_args,
+                                shared_optimizer=shared_optimizer,
+                                private_optimizers=private_optimizers,
+                                private_param_store=private_param_store,
+                                scheduler=scheduler,
+                                step=step,
+                                total_tokens_rank0=total_tokens_rank0,
+                                total_tokens_world=total_tokens_world,
+                                total_flops=total_flops,
+                                total_flops_forward=total_flops_forward,
+                                total_flops_backward=total_flops_backward,
+                                args=args,
+                                best_val_loss=best_val_loss,
+                                is_final=False,
+                                is_best=True,
+                                alpha_scheduler=alpha_scheduler
+                            )
+                        else:
+                            print(
+                                f"New best validation loss: {best_val_loss:.4f} at step {step} (checkpoint saving disabled)"
+                            )
+
+                if should_log:
+                    if eval_results is None:
                         print(
-                            f"New best validation loss: {best_val_loss:.4f} at step {step} (checkpoint saving disabled)"
+                            f"Step {step}, Rank {rank}: Loss={avg_train_loss:.4f}, "
+                            f"LR={lr:.6f}, Tokens/sec={tokens_per_sec:.2f}"
                         )
-                print(f"Step {step}, Rank {rank}: Loss={avg_train_loss:.4f}, LR={lr:.6f}, "
-                    f"Val Loss={eval_results['val_loss']:.4f}, "
-                    f"Perplexity={eval_results['val_perplexity']:.2f}, "
-                    f"Token Acc={eval_results['val_token_accuracy']:.4f}, "
-                    f"Tokens/sec={tokens_per_sec:.2f}")
-                print(f"  Total TFLOPs: {total_flops/1e12:.2f} (Forward: {total_flops_forward/1e12:.2f}, Backward: {total_flops_backward/1e12:.2f})")
+                    else:
+                        print(f"Step {step}, Rank {rank}: Loss={avg_train_loss:.4f}, LR={lr:.6f}, "
+                            f"Val Loss={eval_results['val_loss']:.4f}, "
+                            f"Perplexity={eval_results['val_perplexity']:.2f}, "
+                            f"Token Acc={eval_results['val_token_accuracy']:.4f}, "
+                            f"Tokens/sec={tokens_per_sec:.2f}")
+                    print(f"  Total TFLOPs: {total_flops/1e12:.2f} (Forward: {total_flops_forward/1e12:.2f}, Backward: {total_flops_backward/1e12:.2f})")
             else:
-                print(f"Step {step}, Rank {rank}: Loss={avg_train_loss:.4f}, LR={lr:.6f}")
+                if should_log:
+                    print(f"Step {step}, Rank {rank}: Loss={avg_train_loss:.4f}, LR={lr:.6f}")
 
             model.train()
-            dist.barrier()
+            if should_eval:
+                dist.barrier()
 
         if args.checkpoint_interval_steps > 0 and (step + 1) % args.checkpoint_interval_steps == 0:
             if rank == 0:
@@ -1836,41 +1860,47 @@ def main():
 
     # Final evaluation and checkpoint saving (only when training completes normally)
     # Note: If checkpoint interval is reached, we exit early above (no final eval/checkpoint)
-    # Final evaluation (only on rank 0)
-    if args.stochastic_depth:
+    if args.skip_final_eval:
         if rank == 0:
-            if args.stochastic_depth_mode == 'forward_skip':
-                # Temporarily unmask rank 0 for final evaluation
-                model.set_mask_from_vector(torch.ones(args.num_layers, dtype=torch.int, device=device))
-
-            final_eval = evaluate_model(model, validation_loader, criterion, device, args)
-
-            if args.stochastic_depth_mode == 'forward_skip':
-                # Restore original mask
-                model.set_mask_from_vector(original_mask)
-
-            wandb.log({
-                'final_val_loss': final_eval['val_loss'],
-                'final_val_perplexity': final_eval['val_perplexity'],
-                'final_val_token_accuracy': final_eval['val_token_accuracy']
-            })
-            print(f"Final results: {final_eval}")
+            print("Skipping final validation evaluation")
             print(f"Total tokens processed - Rank 0: {total_tokens_rank0:,}, World: {total_tokens_world:,}")
             print(f"Total TFLOPs - Total: {total_flops/1e12:.2f}, Forward: {total_flops_forward/1e12:.2f}, Backward: {total_flops_backward/1e12:.2f}")
-
-        # Synchronize: all workers wait for rank 0 to finish final evaluation
-        dist.barrier()
     else:
-        if rank == 0:
-            final_eval = evaluate_model(model, validation_loader, criterion, device, args)
-            wandb.log({
-                'final_val_loss': final_eval['val_loss'],
-                'final_val_perplexity': final_eval['val_perplexity'],
-                'final_val_token_accuracy': final_eval['val_token_accuracy']
-            })
-            print(f"Final results: {final_eval}")
-            print(f"Total tokens processed - Rank 0: {total_tokens_rank0:,}, World: {total_tokens_world:,}")
-            print(f"Total TFLOPs - Total: {total_flops/1e12:.2f}, Forward: {total_flops_forward/1e12:.2f}, Backward: {total_flops_backward/1e12:.2f}")
+        # Final evaluation (only on rank 0)
+        if args.stochastic_depth:
+            if rank == 0:
+                if args.stochastic_depth_mode == 'forward_skip':
+                    # Temporarily unmask rank 0 for final evaluation
+                    model.set_mask_from_vector(torch.ones(args.num_layers, dtype=torch.int, device=device))
+
+                final_eval = evaluate_model(model, validation_loader, criterion, device, args)
+
+                if args.stochastic_depth_mode == 'forward_skip':
+                    # Restore original mask
+                    model.set_mask_from_vector(original_mask)
+
+                wandb.log({
+                    'final_val_loss': final_eval['val_loss'],
+                    'final_val_perplexity': final_eval['val_perplexity'],
+                    'final_val_token_accuracy': final_eval['val_token_accuracy']
+                })
+                print(f"Final results: {final_eval}")
+                print(f"Total tokens processed - Rank 0: {total_tokens_rank0:,}, World: {total_tokens_world:,}")
+                print(f"Total TFLOPs - Total: {total_flops/1e12:.2f}, Forward: {total_flops_forward/1e12:.2f}, Backward: {total_flops_backward/1e12:.2f}")
+
+            # Synchronize: all workers wait for rank 0 to finish final evaluation
+            dist.barrier()
+        else:
+            if rank == 0:
+                final_eval = evaluate_model(model, validation_loader, criterion, device, args)
+                wandb.log({
+                    'final_val_loss': final_eval['val_loss'],
+                    'final_val_perplexity': final_eval['val_perplexity'],
+                    'final_val_token_accuracy': final_eval['val_token_accuracy']
+                })
+                print(f"Final results: {final_eval}")
+                print(f"Total tokens processed - Rank 0: {total_tokens_rank0:,}, World: {total_tokens_world:,}")
+                print(f"Total TFLOPs - Total: {total_flops/1e12:.2f}, Forward: {total_flops_forward/1e12:.2f}, Backward: {total_flops_backward/1e12:.2f}")
 
     # Save final checkpoint (only on rank 0)
     if rank == 0 and args.save_final_checkpoint:

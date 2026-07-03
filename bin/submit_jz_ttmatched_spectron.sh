@@ -103,13 +103,15 @@ TOTAL_STEPS="\${TOTAL_STEPS:-$JOB_STEPS}"
 LR_SCHEDULE_STEPS="\${LR_SCHEDULE_STEPS:-$JOB_SCHEDULE_STEPS}"
 GLOBAL_BATCH_SIZE="\${GLOBAL_BATCH_SIZE:-512}"
 MICRO_BATCH_SIZE="\${MICRO_BATCH_SIZE:-16}"
-LOG_INTERVAL="\${LOG_INTERVAL:-10}"
+LOG_INTERVAL="\${LOG_INTERVAL:-1}"
+EVAL_INTERVAL="\${EVAL_INTERVAL:-0}"
 MAX_VAL_SAMPLES="\${MAX_VAL_SAMPLES:-100}"
 CHECKPOINT_INTERVAL_HOURS="\${CHECKPOINT_INTERVAL_HOURS:-2.8}"
 CHECKPOINT_INTERVAL_STEPS="\${CHECKPOINT_INTERVAL_STEPS:-500}"
 CHECKPOINT_KEEP_LATEST_K="\${CHECKPOINT_KEEP_LATEST_K:-2}"
 MAX_LR="\${MAX_LR:-$SUBMIT_MAX_LR}"
 WARMUP_START_FACTOR="\${WARMUP_START_FACTOR:-0.0}"
+SKIP_FINAL_EVAL="\${SKIP_FINAL_EVAL:-1}"
 LR_TAG="\${MAX_LR//./p}"
 LR_TAG="\${LR_TAG//-}"
 RUN_NAME="\${RUN_NAME:-spectron_tt134m_fineweb_adamw_lr\${LR_TAG}_wd0p1_seq2048_steps\${TOTAL_STEPS}_sched\${LR_SCHEDULE_STEPS}_rope10000_\${RUN_MODE}}"
@@ -146,10 +148,16 @@ case "\$RUN_MODE" in
     ;;
 esac
 
+FINAL_EVAL_FLAGS=()
+if [[ "\$SKIP_FINAL_EVAL" == "1" ]]; then
+  FINAL_EVAL_FLAGS=(--skip_final_eval)
+fi
+
 echo "Spectron TT-matched AdamW run"
 echo "  model_size=134m hidden=768 layers=12 heads=12"
 echo "  run_mode=\$RUN_MODE rope_theta=10000 seq_len=2048 total_steps=\$TOTAL_STEPS lr_schedule_steps=\$LR_SCHEDULE_STEPS"
 echo "  lr=\$MAX_LR warmup_start_factor=\$WARMUP_START_FACTOR weight_decay=0.1 batch=\$GLOBAL_BATCH_SIZE micro_batch=\$MICRO_BATCH_SIZE"
+echo "  log_interval=\$LOG_INTERVAL eval_interval=\$EVAL_INTERVAL skip_final_eval=\$SKIP_FINAL_EVAL"
 echo "  data_root=\$DATA_ROOT"
 echo "  run_name=\$RUN_NAME"
 echo "  checkpoint_interval_steps=\$CHECKPOINT_INTERVAL_STEPS checkpoint_keep_latest_k=\$CHECKPOINT_KEEP_LATEST_K"
@@ -182,6 +190,7 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" simple_gpt_training.py \\
   --warmup_ratio 0.05 \\
   --warmup_start_factor "\$WARMUP_START_FACTOR" \\
   --log_interval "\$LOG_INTERVAL" \\
+  --eval_interval "\$EVAL_INTERVAL" \\
   --use_flex_attn \\
   --bf16 \\
   --virtual_workers_per_gpu 1 \\
@@ -195,6 +204,7 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" simple_gpt_training.py \\
   --wandb_project "\$WANDB_PROJECT" \\
   --wandb_entity "\$WANDB_ENTITY" \\
   --run_name "\$RUN_NAME" \\
+  "\${FINAL_EVAL_FLAGS[@]}" \\
   "\${LOW_RANK_FLAGS[@]}"
 EOF
 
