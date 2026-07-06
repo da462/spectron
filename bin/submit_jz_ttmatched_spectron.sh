@@ -17,6 +17,8 @@ SUBMIT_OPTIMIZER="${OPTIMIZER:-adamw}"
 SUBMIT_USE_FLEX_ATTN="${USE_FLEX_ATTN:-1}"
 SUBMIT_TT_STYLE_INIT="${TT_STYLE_INIT:-0}"
 SUBMIT_SPECTRAL_LR_SCALING="${SPECTRAL_LR_SCALING:-0}"
+SUBMIT_SPECTRAL_LR_SCALING_OFFSET="${SPECTRAL_LR_SCALING_OFFSET:-1.0}"
+SUBMIT_SPECTRAL_WEIGHT_DECAY="${SPECTRAL_WEIGHT_DECAY:-0.0}"
 SUBMIT_WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
 SUBMIT_NH_WEIGHT_DECAY="${NH_WEIGHT_DECAY:-$SUBMIT_WEIGHT_DECAY}"
 SUBMIT_LR_TAG="${SUBMIT_MAX_LR//./p}"
@@ -36,6 +38,16 @@ if [[ "$SUBMIT_TT_STYLE_INIT" == "1" ]]; then
 fi
 if [[ "$SUBMIT_SPECTRAL_LR_SCALING" == "1" ]]; then
   JOB_SUFFIX="${JOB_SUFFIX}_spectron"
+fi
+if [[ "$SUBMIT_SPECTRAL_LR_SCALING_OFFSET" == "0" || "$SUBMIT_SPECTRAL_LR_SCALING_OFFSET" == "0.0" ]]; then
+  JOB_SUFFIX="${JOB_SUFFIX}_no_plus_one"
+fi
+if [[ "$SUBMIT_SPECTRAL_WEIGHT_DECAY" != "0" && "$SUBMIT_SPECTRAL_WEIGHT_DECAY" != "0.0" ]]; then
+  SWD_TAG="${SUBMIT_SPECTRAL_WEIGHT_DECAY//./p}"
+  SWD_TAG="${SWD_TAG//e-/em}"
+  SWD_TAG="${SWD_TAG//e+/ep}"
+  SWD_TAG="${SWD_TAG//-/m}"
+  JOB_SUFFIX="${JOB_SUFFIX}_swd${SWD_TAG}"
 fi
 JOB_NAME="spectron_tt134m_${SUBMIT_OPTIMIZER}_${RUN_MODE}_lr${SUBMIT_LR_TAG}_wd${SUBMIT_WD_TAG}_steps${JOB_STEPS}_sched${JOB_SCHEDULE_STEPS}${JOB_SUFFIX}"
 JOB_SCRIPT="$JOB_DIR/${JOB_NAME}_${PROFILE}_${RUN_STAMP}.slurm"
@@ -156,7 +168,8 @@ NH_WEIGHT_DECAY="\${NH_WEIGHT_DECAY:-$SUBMIT_NH_WEIGHT_DECAY}"
 USE_FLEX_ATTN="\${USE_FLEX_ATTN:-$SUBMIT_USE_FLEX_ATTN}"
 TT_STYLE_INIT="\${TT_STYLE_INIT:-$SUBMIT_TT_STYLE_INIT}"
 SPECTRAL_LR_SCALING="\${SPECTRAL_LR_SCALING:-$SUBMIT_SPECTRAL_LR_SCALING}"
-SPECTRAL_WEIGHT_DECAY="\${SPECTRAL_WEIGHT_DECAY:-0.0}"
+SPECTRAL_LR_SCALING_OFFSET="\${SPECTRAL_LR_SCALING_OFFSET:-$SUBMIT_SPECTRAL_LR_SCALING_OFFSET}"
+SPECTRAL_WEIGHT_DECAY="\${SPECTRAL_WEIGHT_DECAY:-$SUBMIT_SPECTRAL_WEIGHT_DECAY}"
 SWD_TYPE="\${SWD_TYPE:-standard}"
 WARMUP_START_FACTOR="\${WARMUP_START_FACTOR:-0.0}"
 SKIP_FINAL_EVAL="\${SKIP_FINAL_EVAL:-1}"
@@ -177,6 +190,16 @@ if [[ "\$TT_STYLE_INIT" == "1" ]]; then
 fi
 if [[ "\$SPECTRAL_LR_SCALING" == "1" ]]; then
   RUN_SUFFIX="\${RUN_SUFFIX}_spectron"
+fi
+if [[ "\$SPECTRAL_LR_SCALING_OFFSET" == "0" || "\$SPECTRAL_LR_SCALING_OFFSET" == "0.0" ]]; then
+  RUN_SUFFIX="\${RUN_SUFFIX}_no_plus_one"
+fi
+if [[ "\$SPECTRAL_WEIGHT_DECAY" != "0" && "\$SPECTRAL_WEIGHT_DECAY" != "0.0" ]]; then
+  SWD_TAG="\${SPECTRAL_WEIGHT_DECAY//./p}"
+  SWD_TAG="\${SWD_TAG//e-/em}"
+  SWD_TAG="\${SWD_TAG//e+/ep}"
+  SWD_TAG="\${SWD_TAG//-/m}"
+  RUN_SUFFIX="\${RUN_SUFFIX}_swd\${SWD_TAG}"
 fi
 RUN_NAME="\${RUN_NAME:-spectron_tt134m_fineweb_\${OPTIMIZER}_lr\${LR_TAG}_wd\${WD_TAG}_seq2048_steps\${TOTAL_STEPS}_sched\${LR_SCHEDULE_STEPS}_rope10000_\${RUN_MODE}\${RUN_SUFFIX}}"
 mkdir -p "\$WANDB_DIR"
@@ -240,7 +263,7 @@ echo "  model_size=134m hidden=768 layers=12 heads=12"
 echo "  optimizer=\$OPTIMIZER run_mode=\$RUN_MODE rope_theta=10000 seq_len=2048 total_steps=\$TOTAL_STEPS lr_schedule_steps=\$LR_SCHEDULE_STEPS"
 echo "  lr=\$MAX_LR warmup_start_factor=\$WARMUP_START_FACTOR weight_decay=\$WEIGHT_DECAY nh_weight_decay=\$NH_WEIGHT_DECAY batch=\$GLOBAL_BATCH_SIZE micro_batch=\$MICRO_BATCH_SIZE"
 echo "  use_flex_attn=\$USE_FLEX_ATTN tt_style_init=\$TT_STYLE_INIT"
-echo "  spectral_lr_scaling=\$SPECTRAL_LR_SCALING spectral_weight_decay=\$SPECTRAL_WEIGHT_DECAY swd_type=\$SWD_TYPE"
+echo "  spectral_lr_scaling=\$SPECTRAL_LR_SCALING spectral_lr_scaling_offset=\$SPECTRAL_LR_SCALING_OFFSET spectral_weight_decay=\$SPECTRAL_WEIGHT_DECAY swd_type=\$SWD_TYPE"
 echo "  log_interval=\$LOG_INTERVAL eval_interval=\$EVAL_INTERVAL skip_final_eval=\$SKIP_FINAL_EVAL"
 echo "  data_root=\$DATA_ROOT"
 echo "  run_name=\$RUN_NAME"
@@ -279,6 +302,7 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" simple_gpt_training.py \\
   "\${ATTN_FLAGS[@]}" \\
   "\${INIT_FLAGS[@]}" \\
   "\${SPECTRAL_FLAGS[@]}" \\
+  --spectral_lr_scaling_offset "\$SPECTRAL_LR_SCALING_OFFSET" \\
   --bf16 \\
   --virtual_workers_per_gpu 1 \\
   --max_val_samples "\$MAX_VAL_SAMPLES" \\

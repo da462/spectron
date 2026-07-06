@@ -40,7 +40,13 @@ def _max_singular_value_power_iter(W, u, Ip=1):
     return sigma, _u, _v
 
 
-def get_lowrank_spectral_norm_scaling(model, power_iter_steps=1, spectral_weight_decay=0.0, swd_type='standard'):
+def get_lowrank_spectral_norm_scaling(
+    model,
+    power_iter_steps=1,
+    spectral_weight_decay=0.0,
+    swd_type='standard',
+    spectral_lr_scaling_offset=1.0,
+):
     """
     Compute spectral norm scaling factors for A and B parameters in LowRankLinear modules.
 
@@ -55,6 +61,9 @@ def get_lowrank_spectral_norm_scaling(model, power_iter_steps=1, spectral_weight
         power_iter_steps: Number of power iteration steps (default 1)
         spectral_weight_decay: Spectral weight decay coefficient (default 0.0, disabled)
         swd_type: Type of spectral weight decay - 'standard' or 'product' (default: 'standard')
+        spectral_lr_scaling_offset: Additive offset in
+            1 / (spectral_norm(A) + spectral_norm(B) + offset). Current default
+            preserves existing behavior with offset=1.0.
 
     Returns:
         tuple: (scaling_factors, regularization_grads)
@@ -150,8 +159,11 @@ def get_lowrank_spectral_norm_scaling(model, power_iter_steps=1, spectral_weight
                         grad_B = grad_B.to(module.B.dtype)
                         regularization_grads[b_param_name] = grad_B
 
-                # Compute scaling factor: 1 / (spectral_norm(A) + spectral_norm(B))
-                sum_spectral_norms = A_spectral_norm + B_spectral_norm + 1
+                # Compute scaling factor:
+                # 1 / (spectral_norm(A) + spectral_norm(B) + offset)
+                sum_spectral_norms = (
+                    A_spectral_norm + B_spectral_norm + spectral_lr_scaling_offset
+                )
 
                 # Avoid division by zero
                 if sum_spectral_norms > 1e-8:

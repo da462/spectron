@@ -636,6 +636,8 @@ def main():
     parser.add_argument('--communicate_lowrank_freq', type=int, default=None, help='Frequency of low-rank A/B parameter communication (steps). If None, syncs every step')
     parser.add_argument('--sanity_check_lowrank', action='store_true', help='Run low-rank sanity check with A=W, C=B=I')
     parser.add_argument('--spectral_lr_scaling', action='store_true', help='Scale learning rate of A and B matrices by 1/(spectral_norm(A) + spectral_norm(B)) (requires --low_rank)')
+    parser.add_argument('--spectral_lr_scaling_offset', type=float, default=1.0,
+                        help='Additive offset for spectral LR scaling denominator (default: 1.0 preserves current behavior)')
     parser.add_argument('--spectral_weight_decay', type=float, default=0.0,
                         help='Spectral norm weight decay coefficient (default: 0.0, disabled)')
     parser.add_argument('--swd_type', type=str, default='standard', choices=['standard', 'product'],
@@ -702,6 +704,8 @@ def main():
         raise ValueError("--eval_interval must be non-negative")
     if args.min_lr_factor < 0:
         raise ValueError("--min_lr_factor must be non-negative")
+    if args.spectral_lr_scaling_offset < 0:
+        raise ValueError("--spectral_lr_scaling_offset must be non-negative")
     if not 0.0 <= args.warmup_start_factor <= 1.0:
         raise ValueError("--warmup_start_factor must be between 0 and 1")
     if args.checkpoint_interval_steps < 0:
@@ -1492,7 +1496,8 @@ def main():
             spectral_scaling, regularization_grads = get_lowrank_spectral_norm_scaling(
                 model,
                 spectral_weight_decay=args.spectral_weight_decay,
-                swd_type=args.swd_type
+                swd_type=args.swd_type,
+                spectral_lr_scaling_offset=args.spectral_lr_scaling_offset,
             )
 
             # Update LR for each low-rank parameter group (only if spectral_lr_scaling)
