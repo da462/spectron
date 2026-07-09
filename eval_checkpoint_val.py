@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
 from pathlib import Path
 
 import torch
@@ -22,10 +23,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--val_files", required=True)
     parser.add_argument("--run_mode", choices=["fullrank", "lowrank_all", "lowrank_attention", "lowrank_ffn"], required=True)
+    parser.add_argument("--low_rank_ratio", type=float, default=0.25)
+    parser.add_argument("--low_rank_w2_same_rank_as_w1w3", action="store_true")
     parser.add_argument("--max_val_samples", type=int, default=12208)
     parser.add_argument("--seq_len", type=int, default=2048)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--bf16", action="store_true")
+    parser.add_argument(
+        "--progress_interval",
+        type=int,
+        default=100,
+        help="Print eval progress every N batches; set 0 to disable.",
+    )
     parser.add_argument("--output_json", required=True)
     return parser.parse_args()
 
@@ -42,7 +51,12 @@ def lowrank_exclusions(run_mode: str) -> list[str]:
     raise ValueError(f"Unsupported run_mode: {run_mode}")
 
 
-def build_model(checkpoint: dict, run_mode: str) -> TitanGPT:
+def build_model(
+    checkpoint: dict,
+    run_mode: str,
+    low_rank_ratio: float,
+    low_rank_w2_same_rank_as_w1w3: bool,
+) -> TitanGPT:
     model_args = dict(checkpoint["model_args"])
     model_args["use_flex_attn"] = True
     args = TitanModelArgs(**model_args)
@@ -50,10 +64,11 @@ def build_model(checkpoint: dict, run_mode: str) -> TitanGPT:
     if run_mode != "fullrank":
         model = replace_linear_with_lowrank(
             model,
-            rank_ratio=0.25,
+            rank_ratio=low_rank_ratio,
             method="random",
             exclude_modules=lowrank_exclusions(run_mode),
             disable_c=True,
+            w2_same_rank_as_w1w3=low_rank_w2_same_rank_as_w1w3,
         )
     state = checkpoint["model_state_dict"]
     if all(k.startswith("module.") for k in state):
@@ -72,7 +87,12 @@ def main() -> None:
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     except TypeError:
         checkpoint = torch.load(args.checkpoint, map_location="cpu")
-    model = build_model(checkpoint, args.run_mode).to(device)
+    model = build_model(
+        checkpoint,
+        args.run_mode,
+        args.low_rank_ratio,
+        args.low_rank_w2_same_rank_as_w1w3,
+    ).to(device)
     model.eval()
 
     dataset = BinaryDataset(
@@ -87,8 +107,16 @@ def main() -> None:
 
     total_loss = 0.0
     total_tokens = 0
+    start_time = time.monotonic()
+    total_batches = len(loader)
+    print(
+        "Starting eval: "
+        f"batches={total_batches}, batch_size={args.batch_size}, "
+        f"seq_len={args.seq_len}, max_val_samples={args.max_val_samples}",
+        flush=True,
+    )
     with torch.no_grad():
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader, start=1):
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
             if args.bf16:
@@ -108,11 +136,26 @@ def main() -> None:
                 )
             total_loss += float(loss.item())
             total_tokens += int(labels.numel())
+            if (
+                args.progress_interval > 0
+                and (batch_idx % args.progress_interval == 0 or batch_idx == total_batches)
+            ):
+                elapsed = time.monotonic() - start_time
+                running_loss = total_loss / max(total_tokens, 1)
+                print(
+                    "Eval progress: "
+                    f"batch={batch_idx}/{total_batches}, "
+                    f"tokens={total_tokens:,}, "
+                    f"loss={running_loss:.6f}, "
+                    f"elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
 
     val_loss = total_loss / total_tokens
     result = {
         "checkpoint": args.checkpoint,
         "run_mode": args.run_mode,
+        "low_rank_ratio": args.low_rank_ratio,
         "max_val_samples": args.max_val_samples,
         "seq_len": args.seq_len,
         "batch_size": args.batch_size,

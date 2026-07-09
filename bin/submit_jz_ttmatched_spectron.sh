@@ -18,9 +18,14 @@ SUBMIT_USE_FLEX_ATTN="${USE_FLEX_ATTN:-1}"
 SUBMIT_TT_STYLE_INIT="${TT_STYLE_INIT:-0}"
 SUBMIT_SPECTRAL_LR_SCALING="${SPECTRAL_LR_SCALING:-0}"
 SUBMIT_SPECTRAL_LR_SCALING_OFFSET="${SPECTRAL_LR_SCALING_OFFSET:-1.0}"
+SUBMIT_SPECTRAL_LR_TARGET="${SPECTRAL_LR_TARGET:-all}"
+SUBMIT_LOWRANK_FFN_LR_MULTIPLIER="${LOWRANK_FFN_LR_MULTIPLIER:-1.0}"
 SUBMIT_SPECTRAL_WEIGHT_DECAY="${SPECTRAL_WEIGHT_DECAY:-0.0}"
 SUBMIT_WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
 SUBMIT_NH_WEIGHT_DECAY="${NH_WEIGHT_DECAY:-$SUBMIT_WEIGHT_DECAY}"
+SUBMIT_MIN_LR_FACTOR="${MIN_LR_FACTOR:-0.0}"
+SUBMIT_LOW_RANK_RATIO="${LOW_RANK_RATIO:-0.25}"
+SUBMIT_LOW_RANK_W2_SAME_RANK="${LOW_RANK_W2_SAME_RANK_AS_W1W3:-0}"
 SUBMIT_LR_TAG="${SUBMIT_MAX_LR//./p}"
 SUBMIT_LR_TAG="${SUBMIT_LR_TAG//e-/em}"
 SUBMIT_LR_TAG="${SUBMIT_LR_TAG//e+/ep}"
@@ -39,6 +44,17 @@ fi
 if [[ "$SUBMIT_SPECTRAL_LR_SCALING" == "1" ]]; then
   JOB_SUFFIX="${JOB_SUFFIX}_spectron"
 fi
+if [[ "$SUBMIT_SPECTRAL_LR_TARGET" != "all" ]]; then
+  TARGET_TAG="${SUBMIT_SPECTRAL_LR_TARGET//[^a-zA-Z0-9]/}"
+  JOB_SUFFIX="${JOB_SUFFIX}_spectral${TARGET_TAG}"
+fi
+if [[ "$SUBMIT_LOWRANK_FFN_LR_MULTIPLIER" != "1" && "$SUBMIT_LOWRANK_FFN_LR_MULTIPLIER" != "1.0" && "$SUBMIT_LOWRANK_FFN_LR_MULTIPLIER" != "1.00" ]]; then
+  FFNLR_TAG="${SUBMIT_LOWRANK_FFN_LR_MULTIPLIER//./p}"
+  FFNLR_TAG="${FFNLR_TAG//e-/em}"
+  FFNLR_TAG="${FFNLR_TAG//e+/ep}"
+  FFNLR_TAG="${FFNLR_TAG//-/m}"
+  JOB_SUFFIX="${JOB_SUFFIX}_ffnlr${FFNLR_TAG}"
+fi
 if [[ "$SUBMIT_SPECTRAL_LR_SCALING_OFFSET" == "0" || "$SUBMIT_SPECTRAL_LR_SCALING_OFFSET" == "0.0" ]]; then
   JOB_SUFFIX="${JOB_SUFFIX}_no_plus_one"
 fi
@@ -48,6 +64,23 @@ if [[ "$SUBMIT_SPECTRAL_WEIGHT_DECAY" != "0" && "$SUBMIT_SPECTRAL_WEIGHT_DECAY" 
   SWD_TAG="${SWD_TAG//e+/ep}"
   SWD_TAG="${SWD_TAG//-/m}"
   JOB_SUFFIX="${JOB_SUFFIX}_swd${SWD_TAG}"
+fi
+if [[ "$SUBMIT_MIN_LR_FACTOR" != "0" && "$SUBMIT_MIN_LR_FACTOR" != "0.0" ]]; then
+  MINLR_TAG="${SUBMIT_MIN_LR_FACTOR//./p}"
+  MINLR_TAG="${MINLR_TAG//e-/em}"
+  MINLR_TAG="${MINLR_TAG//e+/ep}"
+  MINLR_TAG="${MINLR_TAG//-/m}"
+  JOB_SUFFIX="${JOB_SUFFIX}_minlr${MINLR_TAG}"
+fi
+if [[ "$RUN_MODE" != "fullrank" && "$SUBMIT_LOW_RANK_RATIO" != "0.25" && "$SUBMIT_LOW_RANK_RATIO" != "0.250" ]]; then
+  LRANK_TAG="${SUBMIT_LOW_RANK_RATIO//./p}"
+  LRANK_TAG="${LRANK_TAG//e-/em}"
+  LRANK_TAG="${LRANK_TAG//e+/ep}"
+  LRANK_TAG="${LRANK_TAG//-/m}"
+  JOB_SUFFIX="${JOB_SUFFIX}_rr${LRANK_TAG}"
+fi
+if [[ "$RUN_MODE" != "fullrank" && "$SUBMIT_LOW_RANK_W2_SAME_RANK" == "1" ]]; then
+  JOB_SUFFIX="${JOB_SUFFIX}_w2same"
 fi
 JOB_NAME="spectron_tt134m_${SUBMIT_OPTIMIZER}_${RUN_MODE}_lr${SUBMIT_LR_TAG}_wd${SUBMIT_WD_TAG}_steps${JOB_STEPS}_sched${JOB_SCHEDULE_STEPS}${JOB_SUFFIX}"
 JOB_SCRIPT="$JOB_DIR/${JOB_NAME}_${PROFILE}_${RUN_STAMP}.slurm"
@@ -169,8 +202,13 @@ USE_FLEX_ATTN="\${USE_FLEX_ATTN:-$SUBMIT_USE_FLEX_ATTN}"
 TT_STYLE_INIT="\${TT_STYLE_INIT:-$SUBMIT_TT_STYLE_INIT}"
 SPECTRAL_LR_SCALING="\${SPECTRAL_LR_SCALING:-$SUBMIT_SPECTRAL_LR_SCALING}"
 SPECTRAL_LR_SCALING_OFFSET="\${SPECTRAL_LR_SCALING_OFFSET:-$SUBMIT_SPECTRAL_LR_SCALING_OFFSET}"
+SPECTRAL_LR_TARGET="\${SPECTRAL_LR_TARGET:-$SUBMIT_SPECTRAL_LR_TARGET}"
+LOWRANK_FFN_LR_MULTIPLIER="\${LOWRANK_FFN_LR_MULTIPLIER:-$SUBMIT_LOWRANK_FFN_LR_MULTIPLIER}"
 SPECTRAL_WEIGHT_DECAY="\${SPECTRAL_WEIGHT_DECAY:-$SUBMIT_SPECTRAL_WEIGHT_DECAY}"
 SWD_TYPE="\${SWD_TYPE:-standard}"
+MIN_LR_FACTOR="\${MIN_LR_FACTOR:-$SUBMIT_MIN_LR_FACTOR}"
+LOW_RANK_RATIO="\${LOW_RANK_RATIO:-$SUBMIT_LOW_RANK_RATIO}"
+LOW_RANK_W2_SAME_RANK_AS_W1W3="\${LOW_RANK_W2_SAME_RANK_AS_W1W3:-$SUBMIT_LOW_RANK_W2_SAME_RANK}"
 WARMUP_START_FACTOR="\${WARMUP_START_FACTOR:-0.0}"
 SKIP_FINAL_EVAL="\${SKIP_FINAL_EVAL:-1}"
 LR_TAG="\${MAX_LR//./p}"
@@ -191,6 +229,17 @@ fi
 if [[ "\$SPECTRAL_LR_SCALING" == "1" ]]; then
   RUN_SUFFIX="\${RUN_SUFFIX}_spectron"
 fi
+if [[ "\$SPECTRAL_LR_TARGET" != "all" ]]; then
+  TARGET_TAG="\${SPECTRAL_LR_TARGET//[^a-zA-Z0-9]/}"
+  RUN_SUFFIX="\${RUN_SUFFIX}_spectral\${TARGET_TAG}"
+fi
+if [[ "\$LOWRANK_FFN_LR_MULTIPLIER" != "1" && "\$LOWRANK_FFN_LR_MULTIPLIER" != "1.0" && "\$LOWRANK_FFN_LR_MULTIPLIER" != "1.00" ]]; then
+  FFNLR_TAG="\${LOWRANK_FFN_LR_MULTIPLIER//./p}"
+  FFNLR_TAG="\${FFNLR_TAG//e-/em}"
+  FFNLR_TAG="\${FFNLR_TAG//e+/ep}"
+  FFNLR_TAG="\${FFNLR_TAG//-/m}"
+  RUN_SUFFIX="\${RUN_SUFFIX}_ffnlr\${FFNLR_TAG}"
+fi
 if [[ "\$SPECTRAL_LR_SCALING_OFFSET" == "0" || "\$SPECTRAL_LR_SCALING_OFFSET" == "0.0" ]]; then
   RUN_SUFFIX="\${RUN_SUFFIX}_no_plus_one"
 fi
@@ -200,6 +249,23 @@ if [[ "\$SPECTRAL_WEIGHT_DECAY" != "0" && "\$SPECTRAL_WEIGHT_DECAY" != "0.0" ]];
   SWD_TAG="\${SWD_TAG//e+/ep}"
   SWD_TAG="\${SWD_TAG//-/m}"
   RUN_SUFFIX="\${RUN_SUFFIX}_swd\${SWD_TAG}"
+fi
+if [[ "\$MIN_LR_FACTOR" != "0" && "\$MIN_LR_FACTOR" != "0.0" ]]; then
+  MINLR_TAG="\${MIN_LR_FACTOR//./p}"
+  MINLR_TAG="\${MINLR_TAG//e-/em}"
+  MINLR_TAG="\${MINLR_TAG//e+/ep}"
+  MINLR_TAG="\${MINLR_TAG//-/m}"
+  RUN_SUFFIX="\${RUN_SUFFIX}_minlr\${MINLR_TAG}"
+fi
+if [[ "\$RUN_MODE" != "fullrank" && "\$LOW_RANK_RATIO" != "0.25" && "\$LOW_RANK_RATIO" != "0.250" ]]; then
+  LRANK_TAG="\${LOW_RANK_RATIO//./p}"
+  LRANK_TAG="\${LRANK_TAG//e-/em}"
+  LRANK_TAG="\${LRANK_TAG//e+/ep}"
+  LRANK_TAG="\${LRANK_TAG//-/m}"
+  RUN_SUFFIX="\${RUN_SUFFIX}_rr\${LRANK_TAG}"
+fi
+if [[ "\$RUN_MODE" != "fullrank" && "\$LOW_RANK_W2_SAME_RANK_AS_W1W3" == "1" ]]; then
+  RUN_SUFFIX="\${RUN_SUFFIX}_w2same"
 fi
 RUN_NAME="\${RUN_NAME:-spectron_tt134m_fineweb_\${OPTIMIZER}_lr\${LR_TAG}_wd\${WD_TAG}_seq2048_steps\${TOTAL_STEPS}_sched\${LR_SCHEDULE_STEPS}_rope10000_\${RUN_MODE}\${RUN_SUFFIX}}"
 mkdir -p "\$WANDB_DIR"
@@ -212,7 +278,7 @@ case "\$RUN_MODE" in
   lowrank_all)
     LOW_RANK_FLAGS=(
       --low_rank
-      --low_rank_ratio 0.25
+      --low_rank_ratio "\$LOW_RANK_RATIO"
       --disable_c
       --exclude_modules tok_embeddings output
     )
@@ -220,7 +286,7 @@ case "\$RUN_MODE" in
   lowrank_attention)
     LOW_RANK_FLAGS=(
       --low_rank
-      --low_rank_ratio 0.25
+      --low_rank_ratio "\$LOW_RANK_RATIO"
       --disable_c
       --exclude_modules tok_embeddings output feed_forward
     )
@@ -228,12 +294,16 @@ case "\$RUN_MODE" in
   lowrank_ffn)
     LOW_RANK_FLAGS=(
       --low_rank
-      --low_rank_ratio 0.25
+      --low_rank_ratio "\$LOW_RANK_RATIO"
       --disable_c
       --exclude_modules tok_embeddings output attention
     )
     ;;
 esac
+
+if [[ "\$LOW_RANK_W2_SAME_RANK_AS_W1W3" == "1" ]]; then
+  LOW_RANK_FLAGS+=(--low_rank_w2_same_rank_as_w1w3)
+fi
 
 FINAL_EVAL_FLAGS=()
 if [[ "\$SKIP_FINAL_EVAL" == "1" ]]; then
@@ -261,9 +331,11 @@ fi
 echo "Spectron TT-matched run"
 echo "  model_size=134m hidden=768 layers=12 heads=12"
 echo "  optimizer=\$OPTIMIZER run_mode=\$RUN_MODE rope_theta=10000 seq_len=2048 total_steps=\$TOTAL_STEPS lr_schedule_steps=\$LR_SCHEDULE_STEPS"
-echo "  lr=\$MAX_LR warmup_start_factor=\$WARMUP_START_FACTOR weight_decay=\$WEIGHT_DECAY nh_weight_decay=\$NH_WEIGHT_DECAY batch=\$GLOBAL_BATCH_SIZE micro_batch=\$MICRO_BATCH_SIZE"
+echo "  lr=\$MAX_LR min_lr_factor=\$MIN_LR_FACTOR warmup_start_factor=\$WARMUP_START_FACTOR weight_decay=\$WEIGHT_DECAY nh_weight_decay=\$NH_WEIGHT_DECAY batch=\$GLOBAL_BATCH_SIZE micro_batch=\$MICRO_BATCH_SIZE"
 echo "  use_flex_attn=\$USE_FLEX_ATTN tt_style_init=\$TT_STYLE_INIT"
-echo "  spectral_lr_scaling=\$SPECTRAL_LR_SCALING spectral_lr_scaling_offset=\$SPECTRAL_LR_SCALING_OFFSET spectral_weight_decay=\$SPECTRAL_WEIGHT_DECAY swd_type=\$SWD_TYPE"
+echo "  spectral_lr_scaling=\$SPECTRAL_LR_SCALING spectral_lr_scaling_offset=\$SPECTRAL_LR_SCALING_OFFSET spectral_lr_target=\$SPECTRAL_LR_TARGET spectral_weight_decay=\$SPECTRAL_WEIGHT_DECAY swd_type=\$SWD_TYPE"
+echo "  lowrank_ffn_lr_multiplier=\$LOWRANK_FFN_LR_MULTIPLIER"
+echo "  low_rank_ratio=\$LOW_RANK_RATIO low_rank_w2_same_rank_as_w1w3=\$LOW_RANK_W2_SAME_RANK_AS_W1W3"
 echo "  log_interval=\$LOG_INTERVAL eval_interval=\$EVAL_INTERVAL skip_final_eval=\$SKIP_FINAL_EVAL"
 echo "  data_root=\$DATA_ROOT"
 echo "  run_name=\$RUN_NAME"
@@ -271,7 +343,10 @@ echo "  checkpoint_interval_steps=\$CHECKPOINT_INTERVAL_STEPS checkpoint_keep_la
 echo "  wandb_mode=\$WANDB_MODE"
 echo "  wandb_dir=\$WANDB_DIR"
 
-exec torchrun --nproc_per_node="\$NPROC_PER_NODE" simple_gpt_training.py \\
+MASTER_PORT="\${MASTER_PORT:-\$((20000 + SLURM_JOB_ID % 40000))}"
+echo "  master_port=\$MASTER_PORT"
+
+exec torchrun --nproc_per_node="\$NPROC_PER_NODE" --master_port "\$MASTER_PORT" simple_gpt_training.py \\
   --seed 1234 \\
   --hidden_size 768 \\
   --num_layers 12 \\
@@ -290,7 +365,7 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" simple_gpt_training.py \\
   --adam_beta1 0.9 \\
   --adam_beta2 0.95 \\
   --scheduler cosine \\
-  --min_lr_factor 0.0 \\
+  --min_lr_factor "\$MIN_LR_FACTOR" \\
   --batch_size "\$GLOBAL_BATCH_SIZE" \\
   --micro_batch_size "\$MICRO_BATCH_SIZE" \\
   --total_steps "\$TOTAL_STEPS" \\
@@ -303,6 +378,8 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" simple_gpt_training.py \\
   "\${INIT_FLAGS[@]}" \\
   "\${SPECTRAL_FLAGS[@]}" \\
   --spectral_lr_scaling_offset "\$SPECTRAL_LR_SCALING_OFFSET" \\
+  --spectral_lr_target "\$SPECTRAL_LR_TARGET" \\
+  --lowrank_ffn_lr_multiplier "\$LOWRANK_FFN_LR_MULTIPLIER" \\
   --bf16 \\
   --virtual_workers_per_gpu 1 \\
   --max_val_samples "\$MAX_VAL_SAMPLES" \\

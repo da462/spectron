@@ -361,6 +361,7 @@ def replace_linear_with_lowrank(
     layer_indices: Optional[list] = None,
     disable_c: bool = False,
     sanity_check: bool = False,
+    w2_same_rank_as_w1w3: bool = False,
 ) -> nn.Module:
     """
     Replace Linear layers in a model with LowRankLinear layers
@@ -376,6 +377,8 @@ def replace_linear_with_lowrank(
         layer_indices: List of specific layer indices to replace (0-based indexing of eligible layers)
         disable_c: If True, set requires_grad=False for C matrices in ACB factorization
         sanity_check: If True, configure for sanity checking (A=W, C=B=I)
+        w2_same_rank_as_w1w3: If True, feed_forward.w2 uses
+            rank_ratio * out_features instead of rank_ratio * in_features.
 
     Returns:
         Modified model with low-rank Linear layers
@@ -396,6 +399,14 @@ def replace_linear_with_lowrank(
         raise ValueError(
             "rank_ratio must be between 0 and 1 (exclusive of 0, inclusive of 1)."
         )
+
+    def calculate_layer_rank(name: str, module: nn.Linear) -> int:
+        if rank_ratio is None:
+            return rank
+        rank_features = module.in_features
+        if w2_same_rank_as_w1w3 and "feed_forward.w2" in name:
+            rank_features = module.out_features
+        return max(1, int(rank_ratio * rank_features))
 
     def should_replace(name: str, module: nn.Module) -> bool:
         if not isinstance(module, nn.Linear):
@@ -455,9 +466,12 @@ def replace_linear_with_lowrank(
         for i, (name, module) in enumerate(eligible_modules):
             marker = "✓" if name in modules_to_replace else " "
             if rank_ratio is not None:
-                calculated_rank = max(1, int(rank_ratio * module.in_features))
+                calculated_rank = calculate_layer_rank(name, module)
+                rank_source = "out_features" if (
+                    w2_same_rank_as_w1w3 and "feed_forward.w2" in name
+                ) else "in_features"
                 print(
-                    f"  [{i:2d}] {marker} {name}: {module.weight.shape} -> rank {calculated_rank} (ratio={rank_ratio:.3f})"
+                    f"  [{i:2d}] {marker} {name}: {module.weight.shape} -> rank {calculated_rank} (ratio={rank_ratio:.3f}, source={rank_source})"
                 )
             else:
                 print(
@@ -474,7 +488,7 @@ def replace_linear_with_lowrank(
 
         # Calculate rank for this specific layer
         if rank_ratio is not None:
-            calculated_rank = max(1, int(rank_ratio * linear_module.in_features))
+            calculated_rank = calculate_layer_rank(name, linear_module)
         else:
             calculated_rank = rank
 

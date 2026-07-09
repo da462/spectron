@@ -7,7 +7,8 @@ from low_rank_linear import replace_linear_with_lowrank
 
 def calculate_transformer_flops(batch_size, seq_len, vocab_size, hidden_size, num_layers, num_heads,
                                ffn_hidden_size=None, use_low_rank=False, rank_ratio=0.25,
-                               exclude_modules=None, disable_c=False, n_kv_heads=None):
+                               exclude_modules=None, disable_c=False, n_kv_heads=None,
+                               return_breakdown=False, w2_same_rank_as_w1w3=False):
     """
     Manually calculate FLOPs for a transformer model forward pass.
 
@@ -44,7 +45,10 @@ def calculate_transformer_flops(batch_size, seq_len, vocab_size, hidden_size, nu
     def linear_flops(module_name, in_features, out_features, batch_tokens):
         """Calculate FLOPs for a linear layer: y = x @ W^T where x is (batch_tokens, in_features), W is (out_features, in_features)"""
         if module_uses_low_rank(module_name):
-            rank = max(1, int(rank_ratio * in_features))
+            rank_features = in_features
+            if w2_same_rank_as_w1w3 and module_name == "feed_forward.w2":
+                rank_features = out_features
+            rank = max(1, int(rank_ratio * rank_features))
             if disable_c:
                 # AB factorization: W = A @ B
                 # x @ (A @ B)^T = x @ B^T @ A^T
@@ -64,6 +68,8 @@ def calculate_transformer_flops(batch_size, seq_len, vocab_size, hidden_size, nu
             return batch_tokens * in_features * out_features * 2
 
     flops = 0
+    non_attention_forward_flops = 0
+    attention_matmul_forward_flops = 0
     batch_tokens = batch_size * seq_len
 
     # Embedding lookup (no FLOPs, just memory access)
@@ -74,32 +80,50 @@ def calculate_transformer_flops(batch_size, seq_len, vocab_size, hidden_size, nu
     # Per-layer calculations
     for _ in range(num_layers):
         # 1. Attention projections.
-        flops += linear_flops("attention.wq", hidden_size, q_out_features, batch_tokens)
-        flops += linear_flops("attention.wk", hidden_size, kv_out_features, batch_tokens)
-        flops += linear_flops("attention.wv", hidden_size, kv_out_features, batch_tokens)
+        layer_flops = linear_flops("attention.wq", hidden_size, q_out_features, batch_tokens)
+        flops += layer_flops
+        non_attention_forward_flops += layer_flops
+        layer_flops = linear_flops("attention.wk", hidden_size, kv_out_features, batch_tokens)
+        flops += layer_flops
+        non_attention_forward_flops += layer_flops
+        layer_flops = linear_flops("attention.wv", hidden_size, kv_out_features, batch_tokens)
+        flops += layer_flops
+        non_attention_forward_flops += layer_flops
 
         # 2. Attention scores: Q @ K^T
         # (batch_size, num_heads, seq_len, head_dim) @ (batch_size, num_heads, head_dim, seq_len)
-        flops += batch_size * num_heads * seq_len * seq_len * head_dim * 2
+        layer_flops = batch_size * num_heads * seq_len * seq_len * head_dim * 2
+        flops += layer_flops
+        attention_matmul_forward_flops += layer_flops
 
         # 3. Attention softmax: ~5 ops per element
         # flops += batch_size * num_heads * seq_len * seq_len * 5
 
         # 4. Attention weighted sum: softmax @ V
-        flops += batch_size * num_heads * seq_len * seq_len * head_dim * 2
+        layer_flops = batch_size * num_heads * seq_len * seq_len * head_dim * 2
+        flops += layer_flops
+        attention_matmul_forward_flops += layer_flops
 
         # 5. Attention output projection: (hidden_size -> hidden_size)
-        flops += linear_flops("attention.wo", q_out_features, hidden_size, batch_tokens)
+        layer_flops = linear_flops("attention.wo", q_out_features, hidden_size, batch_tokens)
+        flops += layer_flops
+        non_attention_forward_flops += layer_flops
 
         # 6. SwiGLU FFN projections: W1 and W3 up, W2 down.
-        flops += linear_flops("feed_forward.w1", hidden_size, ffn_hidden_size, batch_tokens)
-        flops += linear_flops("feed_forward.w3", hidden_size, ffn_hidden_size, batch_tokens)
+        layer_flops = linear_flops("feed_forward.w1", hidden_size, ffn_hidden_size, batch_tokens)
+        flops += layer_flops
+        non_attention_forward_flops += layer_flops
+        layer_flops = linear_flops("feed_forward.w3", hidden_size, ffn_hidden_size, batch_tokens)
+        flops += layer_flops
+        non_attention_forward_flops += layer_flops
 
         # 7. FFN activation (SwiGLU or GeLU): ~8 ops per element
         # flops += batch_tokens * ffn_hidden_size * 8
 
         # 8. FFN down projection: (ffn_hidden_size -> hidden_size)
-        flops += linear_flops("feed_forward.w2", ffn_hidden_size, hidden_size, batch_tokens)
+        layer_flops = linear_flops("feed_forward.w2", ffn_hidden_size, hidden_size, batch_tokens)
+        flops += layer_flops
+        non_attention_forward_flops += layer_flops
 
         # 9. Layer norms: ~5 ops per element (mean, variance, normalize, scale, shift)
         # Two layer norms per transformer layer
@@ -109,12 +133,87 @@ def calculate_transformer_flops(batch_size, seq_len, vocab_size, hidden_size, nu
     # flops += batch_tokens * hidden_size * 5
 
     # Output projection: (hidden_size -> vocab_size)
-    flops += linear_flops("output", hidden_size, vocab_size, batch_tokens)
+    layer_flops = linear_flops("output", hidden_size, vocab_size, batch_tokens)
+    flops += layer_flops
+    non_attention_forward_flops += layer_flops
 
     # # Cross-entropy loss: softmax (~5 ops) + log (~3 ops) per element
     # flops += batch_tokens * vocab_size * 8
 
+    if return_breakdown:
+        return {
+            "forward_total": flops,
+            "non_attention_forward": non_attention_forward_flops,
+            "attention_matmul_forward_full": attention_matmul_forward_flops,
+        }
+
     return flops
+
+
+def calculate_transformer_training_flops(
+    batch_size,
+    seq_len,
+    vocab_size,
+    hidden_size,
+    num_layers,
+    num_heads,
+    ffn_hidden_size=None,
+    use_low_rank=False,
+    rank_ratio=0.25,
+    exclude_modules=None,
+    disable_c=False,
+    n_kv_heads=None,
+    attention_flop_accounting="flash_causal_7",
+    w2_same_rank_as_w1w3=False,
+):
+    """Calculate forward/backward/total training FLOPs.
+
+    `rough_full_3x` preserves the original model_analysis.py convention:
+    full dense attention forward and backward estimated as 2x forward.
+
+    `flash_causal_7` uses the more detailed causal FlashAttention matmul
+    estimate for the attention matmul term: forward causal QK+AV is 2bt^2d,
+    backward contributes about 4bt^2d plus 1bt^2d recomputation, for 7bt^2d
+    total over training. Projection, FFN, and LM-head terms still use the
+    standard 3x forward+backward approximation.
+
+    `flash_causal_8` is a conservative variant: causal forward 2bt^2d times
+    4 for training with recompute, giving 8bt^2d.
+    """
+    breakdown = calculate_transformer_flops(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        ffn_hidden_size=ffn_hidden_size,
+        use_low_rank=use_low_rank,
+        rank_ratio=rank_ratio,
+        exclude_modules=exclude_modules,
+        disable_c=disable_c,
+        n_kv_heads=n_kv_heads,
+        return_breakdown=True,
+        w2_same_rank_as_w1w3=w2_same_rank_as_w1w3,
+    )
+
+    non_attention_forward = breakdown["non_attention_forward"]
+    full_attention_forward = breakdown["attention_matmul_forward_full"]
+
+    if attention_flop_accounting == "rough_full_3x":
+        forward = non_attention_forward + full_attention_forward
+        total = 3 * forward
+    elif attention_flop_accounting == "flash_causal_8":
+        forward = non_attention_forward + 0.5 * full_attention_forward
+        total = 3 * non_attention_forward + 2.0 * full_attention_forward
+    elif attention_flop_accounting == "flash_causal_7":
+        forward = non_attention_forward + 0.5 * full_attention_forward
+        total = 3 * non_attention_forward + 1.75 * full_attention_forward
+    else:
+        raise ValueError(f"Unknown attention_flop_accounting: {attention_flop_accounting}")
+
+    backward = total - forward
+    return int(forward), int(backward), int(total)
 
 
 flavors = {
@@ -230,6 +329,8 @@ def main():
     # Low-rank training config
     parser.add_argument('--low_rank', action='store_true', help='Enable low-rank linear layer decomposition')
     parser.add_argument('--low_rank_ratio', type=float, default=0.25, help='Low-rank ratio for calculating rank as ratio * in_features (default: 0.25)')
+    parser.add_argument('--low_rank_w2_same_rank_as_w1w3', action='store_true',
+                        help='For feed_forward.w2, calculate low-rank rank from out_features instead of in_features')
     parser.add_argument('--max_layers', type=int, default=None, help='Maximum number of layers to apply low-rank decomposition (default: all eligible layers)')
     parser.add_argument('--layer_indices', type=int, nargs='+', default=None, help='Specific layer indices to apply low-rank decomposition (0-based indexing)')
     parser.add_argument('--exclude_modules', type=str, nargs='+', default=['tok_embeddings','output'], help='Modules to exclude from low-rank decomposition')
@@ -239,6 +340,12 @@ def main():
     # FLOP calculation config
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size for FLOP calculation')
     parser.add_argument('--seq_len', type=int, default=1024, help='Sequence length for FLOP calculation')
+    parser.add_argument(
+        '--attention_flop_accounting',
+        choices=['flash_causal_7', 'flash_causal_8', 'rough_full_3x'],
+        default='flash_causal_7',
+        help='Training FLOP accounting for attention matmuls. Default flash_causal_7 uses the detailed causal FlashAttention estimate.',
+    )
     parser.add_argument(
         '--flop_match_steps',
         type=int,
@@ -326,7 +433,8 @@ def main():
             max_layers=args.max_layers,
             layer_indices=args.layer_indices,
             disable_c=args.disable_c,
-            sanity_check=args.sanity_check_lowrank
+            sanity_check=args.sanity_check_lowrank,
+            w2_same_rank_as_w1w3=args.low_rank_w2_same_rank_as_w1w3,
         )
 
         low_rank_params = sum(p.numel() for p in model.parameters())
@@ -356,10 +464,11 @@ def main():
     print(f"  Batch size: {args.batch_size}")
     print(f"  Sequence length: {args.seq_len}")
     print(f"  FFN hidden dimension: {ffn_hidden_dim}")
+    print(f"  Attention FLOP accounting: {args.attention_flop_accounting}")
     print()
 
-    # Calculate forward pass FLOPs (non-embedding only, as per the commented out lines)
-    flops_per_step_forward = calculate_transformer_flops(
+    # Calculate training FLOPs analytically.
+    flops_per_step_forward, flops_per_step_backward, flops_per_step_total = calculate_transformer_training_flops(
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         vocab_size=args.vocab_size,
@@ -372,11 +481,9 @@ def main():
         exclude_modules=args.exclude_modules if args.low_rank else [],
         disable_c=args.disable_c if args.low_rank else False,
         n_kv_heads=args.n_kv_heads,
+        attention_flop_accounting=args.attention_flop_accounting,
+        w2_same_rank_as_w1w3=args.low_rank_w2_same_rank_as_w1w3,
     )
-
-    # Estimate backward pass as 2x forward pass
-    flops_per_step_backward = 2 * flops_per_step_forward
-    flops_per_step_total = flops_per_step_forward + flops_per_step_backward
 
     # Convert to TFLOPs for readable output
     tflops_forward = flops_per_step_forward / 1e12
@@ -431,7 +538,11 @@ def main():
         print()
 
         # Calculate full-rank FLOPs
-        flops_per_step_full_forward = calculate_transformer_flops(
+        (
+            flops_per_step_full_forward,
+            flops_per_step_full_backward,
+            flops_per_step_full_total,
+        ) = calculate_transformer_training_flops(
             batch_size=args.batch_size,
             seq_len=args.seq_len,
             vocab_size=args.vocab_size,
@@ -444,8 +555,9 @@ def main():
             exclude_modules=[],
             disable_c=False,
             n_kv_heads=args.n_kv_heads,
+            attention_flop_accounting=args.attention_flop_accounting,
+            w2_same_rank_as_w1w3=False,
         )
-        flops_per_step_full_total = flops_per_step_full_forward * 3  # forward + 2x backward
 
         # Calculate full-rank FLOPs/param ratio
         flops_per_param_ratio_full = flops_per_step_full_forward / (

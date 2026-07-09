@@ -17,6 +17,13 @@ from datetime import datetime
 from pathlib import Path
 from power_iter import get_lowrank_spectral_norm_scaling
 from matrix_analysis import compute_matrix_metrics
+from optimizer_routing import (
+    SPECTRAL_LR_TARGET_CHOICES,
+    apply_lowrank_lr_overrides,
+    lowrank_decoupled_weight_decay_lr,
+    lowrank_lr_multiplier_for_param,
+    lowrank_module_type,
+)
 # Base seed for reproducibility. Keep the historical default unless a run
 # explicitly overrides it.
 BASE_SEED = 1337
@@ -628,6 +635,8 @@ def main():
     # Low-rank training config
     parser.add_argument('--low_rank', action='store_true', help='Enable low-rank linear layer decomposition')
     parser.add_argument('--low_rank_ratio', type=float, default=0.25, help='Low-rank ratio for calculating rank as ratio * in_features (default: 0.25)')
+    parser.add_argument('--low_rank_w2_same_rank_as_w1w3', action='store_true',
+                        help='For feed_forward.w2, calculate low-rank rank from out_features instead of in_features')
     parser.add_argument('--max_layers', type=int, default=None, help='Maximum number of layers to apply low-rank decomposition (default: all eligible layers)')
     parser.add_argument('--layer_indices', type=int, nargs='+', default=None, help='Specific layer indices to apply low-rank decomposition (0-based indexing)')
     parser.add_argument('--exclude_modules', type=str, nargs='+', default=['tok_embeddings','output'], help='Modules to exclude from low-rank decomposition')
@@ -638,6 +647,10 @@ def main():
     parser.add_argument('--spectral_lr_scaling', action='store_true', help='Scale learning rate of A and B matrices by 1/(spectral_norm(A) + spectral_norm(B)) (requires --low_rank)')
     parser.add_argument('--spectral_lr_scaling_offset', type=float, default=1.0,
                         help='Additive offset for spectral LR scaling denominator (default: 1.0 preserves current behavior)')
+    parser.add_argument('--spectral_lr_target', type=str, default='all', choices=SPECTRAL_LR_TARGET_CHOICES,
+                        help='Which low-rank factors receive Spectron LR scaling: all, attention, ffn, or none')
+    parser.add_argument('--lowrank_ffn_lr_multiplier', type=float, default=1.0,
+                        help='Multiplier applied to FFN low-rank factor base LR before any Spectron scaling')
     parser.add_argument('--spectral_weight_decay', type=float, default=0.0,
                         help='Spectral norm weight decay coefficient (default: 0.0, disabled)')
     parser.add_argument('--swd_type', type=str, default='standard', choices=['standard', 'product'],
@@ -706,6 +719,12 @@ def main():
         raise ValueError("--min_lr_factor must be non-negative")
     if args.spectral_lr_scaling_offset < 0:
         raise ValueError("--spectral_lr_scaling_offset must be non-negative")
+    if args.lowrank_ffn_lr_multiplier <= 0:
+        raise ValueError("--lowrank_ffn_lr_multiplier must be positive")
+    if args.lowrank_ffn_lr_multiplier != 1.0 and not args.low_rank:
+        raise ValueError("--lowrank_ffn_lr_multiplier requires --low_rank")
+    if args.lowrank_ffn_lr_multiplier != 1.0 and args.optimizer != "muon":
+        raise ValueError("--lowrank_ffn_lr_multiplier is currently supported only with --optimizer muon")
     if not 0.0 <= args.warmup_start_factor <= 1.0:
         raise ValueError("--warmup_start_factor must be between 0 and 1")
     if args.checkpoint_interval_steps < 0:
@@ -790,7 +809,8 @@ def main():
             max_layers=args.max_layers,
             layer_indices=args.layer_indices,
             disable_c=args.disable_c,
-            sanity_check=args.sanity_check_lowrank
+            sanity_check=args.sanity_check_lowrank,
+            w2_same_rank_as_w1w3=args.low_rank_w2_same_rank_as_w1w3,
         )
         model = model.to(device)
         if rank == 0:
@@ -1009,11 +1029,17 @@ def main():
             param_groups.append({
                 'params': [param],
                 'use_muon': True,
-                'lr': args.max_lr,  # Will be scaled dynamically
-                'weight_decay': 0.0,
+                'lr': args.max_lr * lowrank_lr_multiplier_for_param(
+                    name, args.lowrank_ffn_lr_multiplier
+                ),  # May be scaled dynamically
+                'weight_decay': 0.0 if args.spectral_lr_scaling else args.weight_decay,
                 'adjust_lr_fn': args.adjust_muon_lr,
                 'is_lowrank': True,
-                'param_name': name
+                'param_name': name,
+                'lowrank_module_type': lowrank_module_type(name),
+                'lr_multiplier': lowrank_lr_multiplier_for_param(
+                    name, args.lowrank_ffn_lr_multiplier
+                ),
             })
 
         return param_groups
@@ -1046,12 +1072,13 @@ def main():
         ]
         return param_groups
 
-    def create_optimizer(param_list, param_names=None, use_spectral_lr=False):
+    def create_optimizer(param_list, param_names=None, use_lowrank_individual_groups=False):
         """Create optimizer based on args.optimizer"""
-        if use_spectral_lr and param_names is not None:
-            # Use Muon with spectral LR scaling groups
+        if use_lowrank_individual_groups and param_names is not None:
+            # Use Muon with individual low-rank groups for spectral LR scaling
+            # and/or explicit low-rank FFN LR multipliers.
             if not MUON_AVAILABLE:
-                raise ImportError("Spectral LR scaling requires Muon optimizer. Install with: pip install muon")
+                raise ImportError("Low-rank Muon factor groups require Muon optimizer. Install with: pip install muon")
             return MuonWithAuxAdam(build_spectral_lr_muon_groups(param_list, param_names))
         elif args.optimizer == 'muon':
             if param_names is None:
@@ -1067,7 +1094,14 @@ def main():
     # Shared params list
     shared_params_list = [param_dict[n] for n in param_dict.keys() if n in shared_param_names]
     shared_param_names_list = [n for n in param_dict.keys() if n in shared_param_names]
-    shared_optimizer = create_optimizer(shared_params_list, shared_param_names_list, use_spectral_lr=args.spectral_lr_scaling)
+    use_lowrank_individual_groups = (
+        args.spectral_lr_scaling or args.lowrank_ffn_lr_multiplier != 1.0
+    )
+    shared_optimizer = create_optimizer(
+        shared_params_list,
+        shared_param_names_list,
+        use_lowrank_individual_groups=use_lowrank_individual_groups,
+    )
 
     if rank == 0:
         print(f"\nOptimizer: {args.optimizer}")
@@ -1080,7 +1114,11 @@ def main():
             print(f"  Adam betas: ({args.adam_beta1}, {args.adam_beta2})")
         print(f"  Weight decay: {args.weight_decay}")
         if args.spectral_lr_scaling:
-            print(f"  Spectral LR scaling: ENABLED (A/B lr = base_lr / (spectral_norm(A) + spectral_norm(B)))")
+            print(f"  Spectral LR scaling: ENABLED")
+            print(f"    target: {args.spectral_lr_target}")
+            print(f"    A/B lr = base_lr * multiplier / (spectral_norm(A) + spectral_norm(B) + {args.spectral_lr_scaling_offset})")
+        if args.lowrank_ffn_lr_multiplier != 1.0:
+            print(f"  Low-rank FFN LR multiplier: {args.lowrank_ffn_lr_multiplier}")
         print()
 
     # Private params storage and per-virtual optimizers
@@ -1486,28 +1524,31 @@ def main():
         # Calculate gradient norm before clipping
         grad_norm = torch.nn.utils.clip_grad_norm_(shared_params_list, max_norm=1.0)
 
-        # Apply spectral LR scaling and/or spectral weight decay if enabled
-        if args.spectral_lr_scaling or args.spectral_weight_decay > 0:
-            # Get current base LR from scheduler (only needed if spectral_lr_scaling)
-            if args.spectral_lr_scaling:
-                base_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else args.max_lr
+        base_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else args.max_lr
 
+        # Apply low-rank LR routing and/or spectral weight decay if enabled
+        if use_lowrank_individual_groups or args.spectral_weight_decay > 0:
             # Compute spectral norm scaling factors and regularization gradients
-            spectral_scaling, regularization_grads = get_lowrank_spectral_norm_scaling(
-                model,
-                spectral_weight_decay=args.spectral_weight_decay,
-                swd_type=args.swd_type,
-                spectral_lr_scaling_offset=args.spectral_lr_scaling_offset,
-            )
+            if args.spectral_lr_scaling or args.spectral_weight_decay > 0:
+                spectral_scaling, regularization_grads = get_lowrank_spectral_norm_scaling(
+                    model,
+                    spectral_weight_decay=args.spectral_weight_decay,
+                    swd_type=args.swd_type,
+                    spectral_lr_scaling_offset=args.spectral_lr_scaling_offset,
+                )
+            else:
+                spectral_scaling, regularization_grads = {}, {}
 
-            # Update LR for each low-rank parameter group (only if spectral_lr_scaling)
-            if args.spectral_lr_scaling:
-                for pg in shared_optimizer.param_groups:
-                    if pg.get('is_lowrank', False) and 'param_name' in pg:
-                        param_name = pg['param_name']
-                        if param_name in spectral_scaling:
-                            # Scale LR by 1/(spectral_norm(A) + spectral_norm(B))
-                            pg['lr'] = base_lr * spectral_scaling[param_name]
+            # Update LR for each low-rank parameter group.
+            if use_lowrank_individual_groups:
+                apply_lowrank_lr_overrides(
+                    shared_optimizer.param_groups,
+                    base_lr=base_lr,
+                    spectral_scaling=spectral_scaling,
+                    spectral_lr_target=args.spectral_lr_target,
+                    lowrank_ffn_lr_multiplier=args.lowrank_ffn_lr_multiplier,
+                    apply_spectral_lr_scaling=args.spectral_lr_scaling,
+                )
 
             # Apply decoupled spectral weight decay if enabled
             with torch.no_grad():
@@ -1542,8 +1583,13 @@ def main():
             with torch.no_grad():
                 for pg in shared_optimizer.param_groups:
                     if pg.get('is_lowrank', False) and 'param_name' in pg:
+                        decay_lr = lowrank_decoupled_weight_decay_lr(
+                            pg,
+                            base_lr=base_lr,
+                            spectral_lr_target=args.spectral_lr_target,
+                        )
                         for param in pg['params']:
-                            param.mul_(1 - args.weight_decay * base_lr)
+                            param.mul_(1 - args.weight_decay * decay_lr)
 
         # Step shared optimizer once per global step
         shared_optimizer.step()
