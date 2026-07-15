@@ -38,6 +38,22 @@ def lowrank_lr_multiplier_for_param(param_name: str, ffn_multiplier: float) -> f
     return 1.0
 
 
+def lowrank_weight_decay_for_param(
+    param_name: str,
+    *,
+    default_weight_decay: float,
+    ffn_weight_decay: float | None = None,
+    attention_weight_decay: float | None = None,
+) -> float:
+    """Return decoupled WD for a low-rank factor, with optional owner overrides."""
+    module_type = lowrank_module_type(param_name)
+    if module_type == "ffn" and ffn_weight_decay is not None:
+        return ffn_weight_decay
+    if module_type == "attention" and attention_weight_decay is not None:
+        return attention_weight_decay
+    return default_weight_decay
+
+
 def apply_lowrank_lr_overrides(
     param_groups: MutableSequence[dict],
     *,

@@ -23,6 +23,7 @@ from optimizer_routing import (
     lowrank_decoupled_weight_decay_lr,
     lowrank_lr_multiplier_for_param,
     lowrank_module_type,
+    lowrank_weight_decay_for_param,
 )
 # Base seed for reproducibility. Keep the historical default unless a run
 # explicitly overrides it.
@@ -655,6 +656,10 @@ def main():
                         help='Which low-rank factors receive Spectron LR scaling: all, attention, ffn, or none')
     parser.add_argument('--lowrank_ffn_lr_multiplier', type=float, default=1.0,
                         help='Multiplier applied to FFN low-rank factor base LR before any Spectron scaling')
+    parser.add_argument('--lowrank_ffn_weight_decay', type=float, default=None,
+                        help='Override decoupled weight decay for FFN low-rank factors')
+    parser.add_argument('--lowrank_attention_weight_decay', type=float, default=None,
+                        help='Override decoupled weight decay for attention low-rank factors')
     parser.add_argument('--spectral_weight_decay', type=float, default=0.0,
                         help='Spectral norm weight decay coefficient (default: 0.0, disabled)')
     parser.add_argument('--swd_type', type=str, default='standard', choices=['standard', 'product'],
@@ -729,6 +734,21 @@ def main():
         raise ValueError("--lowrank_ffn_lr_multiplier requires --low_rank")
     if args.lowrank_ffn_lr_multiplier != 1.0 and args.optimizer != "muon":
         raise ValueError("--lowrank_ffn_lr_multiplier is currently supported only with --optimizer muon")
+    lowrank_weight_decay_overridden = (
+        args.lowrank_ffn_weight_decay is not None
+        or args.lowrank_attention_weight_decay is not None
+    )
+    if args.lowrank_ffn_weight_decay is not None and args.lowrank_ffn_weight_decay < 0:
+        raise ValueError("--lowrank_ffn_weight_decay must be non-negative")
+    if (
+        args.lowrank_attention_weight_decay is not None
+        and args.lowrank_attention_weight_decay < 0
+    ):
+        raise ValueError("--lowrank_attention_weight_decay must be non-negative")
+    if lowrank_weight_decay_overridden and not args.low_rank:
+        raise ValueError("Low-rank weight decay overrides require --low_rank")
+    if lowrank_weight_decay_overridden and args.optimizer != "muon":
+        raise ValueError("Low-rank weight decay overrides are currently supported only with --optimizer muon")
     if args.low_rank_attention_per_head_rank is not None and args.low_rank_attention_per_head_rank <= 0:
         raise ValueError("--low_rank_attention_per_head_rank must be positive")
     if args.low_rank_attention_factorization == "per_head":
@@ -1047,13 +1067,19 @@ def main():
         # Create individual parameter groups for each A/B parameter (use Muon since they're 2D)
         # This allows us to set individual learning rates
         for name, param in lowrank_params.items():
+            lowrank_weight_decay = lowrank_weight_decay_for_param(
+                name,
+                default_weight_decay=args.weight_decay,
+                ffn_weight_decay=args.lowrank_ffn_weight_decay,
+                attention_weight_decay=args.lowrank_attention_weight_decay,
+            )
             param_groups.append({
                 'params': [param],
                 'use_muon': True,
                 'lr': args.max_lr * lowrank_lr_multiplier_for_param(
                     name, args.lowrank_ffn_lr_multiplier
                 ),  # May be scaled dynamically
-                'weight_decay': 0.0 if args.spectral_lr_scaling else args.weight_decay,
+                'weight_decay': 0.0 if args.spectral_lr_scaling else lowrank_weight_decay,
                 'adjust_lr_fn': args.adjust_muon_lr,
                 'is_lowrank': True,
                 'param_name': name,
@@ -1061,6 +1087,7 @@ def main():
                 'lr_multiplier': lowrank_lr_multiplier_for_param(
                     name, args.lowrank_ffn_lr_multiplier
                 ),
+                'lowrank_weight_decay': lowrank_weight_decay,
             })
 
         return param_groups
@@ -1116,7 +1143,9 @@ def main():
     shared_params_list = [param_dict[n] for n in param_dict.keys() if n in shared_param_names]
     shared_param_names_list = [n for n in param_dict.keys() if n in shared_param_names]
     use_lowrank_individual_groups = (
-        args.spectral_lr_scaling or args.lowrank_ffn_lr_multiplier != 1.0
+        args.spectral_lr_scaling
+        or args.lowrank_ffn_lr_multiplier != 1.0
+        or lowrank_weight_decay_overridden
     )
     shared_optimizer = create_optimizer(
         shared_params_list,
@@ -1140,6 +1169,10 @@ def main():
             print(f"    A/B lr = base_lr * multiplier / (spectral_norm(A) + spectral_norm(B) + {args.spectral_lr_scaling_offset})")
         if args.lowrank_ffn_lr_multiplier != 1.0:
             print(f"  Low-rank FFN LR multiplier: {args.lowrank_ffn_lr_multiplier}")
+        if args.lowrank_ffn_weight_decay is not None:
+            print(f"  Low-rank FFN weight decay override: {args.lowrank_ffn_weight_decay}")
+        if args.lowrank_attention_weight_decay is not None:
+            print(f"  Low-rank attention weight decay override: {args.lowrank_attention_weight_decay}")
         print()
 
     # Private params storage and per-virtual optimizers
@@ -1599,18 +1632,25 @@ def main():
                                     base_lr * frob_regularization_grads[param_name]
                                 )
 
-        # Do weight decay with base lr for low-rank params if using spectral LR scaling
-        if args.spectral_lr_scaling and args.weight_decay > 0:
+        # Do decoupled WD manually for low-rank params when Spectron scaling
+        # disables optimizer WD on those groups. Targeted Spectron factors use
+        # the base LR; non-target low-rank Muon groups use their plain LR.
+        if args.spectral_lr_scaling:
             with torch.no_grad():
                 for pg in shared_optimizer.param_groups:
                     if pg.get('is_lowrank', False) and 'param_name' in pg:
+                        lowrank_weight_decay = pg.get(
+                            'lowrank_weight_decay', args.weight_decay
+                        )
+                        if lowrank_weight_decay <= 0:
+                            continue
                         decay_lr = lowrank_decoupled_weight_decay_lr(
                             pg,
                             base_lr=base_lr,
                             spectral_lr_target=args.spectral_lr_target,
                         )
                         for param in pg['params']:
-                            param.mul_(1 - args.weight_decay * decay_lr)
+                            param.mul_(1 - lowrank_weight_decay * decay_lr)
 
         # Step shared optimizer once per global step
         shared_optimizer.step()
