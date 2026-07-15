@@ -350,6 +350,187 @@ class LowRankLinear(nn.Module):
         return lr_layer
 
 
+class PerHeadLowRankLinear(nn.Module):
+    """
+    Per-head AB low-rank decomposition for attention projections.
+
+    Row-block projections such as Wq/Wk/Wv store one low-rank matrix per output
+    head block:
+      A: (num_heads, head_dim, rank), B: (num_heads, rank, in_features)
+
+    Column-block projections such as Wo store one low-rank matrix per input head
+    block:
+      A: (num_heads, out_features, rank), B: (num_heads, rank, head_dim)
+
+    The module deliberately uses parameter names A/B so existing Spectron/Muon
+    parameter routing can treat it like LowRankLinear.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        num_heads: int,
+        head_dim: int,
+        block_axis: str,
+        bias: bool = True,
+    ):
+        super().__init__()
+        if block_axis not in {"row", "column"}:
+            raise ValueError(f"block_axis must be 'row' or 'column', got {block_axis!r}")
+        if rank <= 0:
+            raise ValueError(f"rank must be positive, got {rank}")
+        if num_heads <= 0:
+            raise ValueError(f"num_heads must be positive, got {num_heads}")
+        if head_dim <= 0:
+            raise ValueError(f"head_dim must be positive, got {head_dim}")
+        if block_axis == "row" and out_features != num_heads * head_dim:
+            raise ValueError(
+                "row-block per-head low-rank requires "
+                "out_features == num_heads * head_dim"
+            )
+        if block_axis == "column" and in_features != num_heads * head_dim:
+            raise ValueError(
+                "column-block per-head low-rank requires "
+                "in_features == num_heads * head_dim"
+            )
+        if rank > min(in_features, out_features, head_dim):
+            raise ValueError(
+                f"rank {rank} is too large for per-head dimensions "
+                f"in={in_features}, out={out_features}, head_dim={head_dim}"
+            )
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.block_axis = block_axis
+        self.disable_c = True
+
+        if block_axis == "row":
+            self.A = nn.Parameter(torch.empty(num_heads, head_dim, rank))
+            self.B = nn.Parameter(torch.empty(num_heads, rank, in_features))
+        else:
+            self.A = nn.Parameter(torch.empty(num_heads, out_features, rank))
+            self.B = nn.Parameter(torch.empty(num_heads, rank, head_dim))
+
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter("bias", None)
+
+        left_dim = self.A.shape[-2]
+        u_A = torch.randn(num_heads, 1, left_dim)
+        u_B = torch.randn(num_heads, 1, rank)
+        self.register_buffer("u_A", u_A / (u_A.norm(dim=-1, keepdim=True) + 1e-12))
+        self.register_buffer("u_B", u_B / (u_B.norm(dim=-1, keepdim=True) + 1e-12))
+
+        self.reset_parameters()
+
+    @property
+    def weight(self):
+        return self.get_full_weight()
+
+    def reset_parameters(self):
+        if self.block_axis == "row":
+            bound_A = math.sqrt(6.0 / (self.head_dim + self.rank))
+            bound_B = math.sqrt(6.0 / (self.rank + self.in_features))
+        else:
+            bound_A = math.sqrt(6.0 / (self.out_features + self.rank))
+            bound_B = math.sqrt(6.0 / (self.rank + self.head_dim))
+        nn.init.uniform_(self.A, -bound_A, bound_A)
+        nn.init.uniform_(self.B, -bound_B, bound_B)
+
+        if self.bias is not None:
+            bound_bias = 1 / math.sqrt(self.in_features)
+            nn.init.uniform_(self.bias, -bound_bias, bound_bias)
+
+    def get_full_weight(self):
+        if self.block_axis == "row":
+            head_weights = torch.einsum("hdr,hri->hdi", self.A, self.B)
+            weight = head_weights.reshape(self.out_features, self.in_features)
+        else:
+            head_weights = torch.einsum("hor,hrd->hod", self.A, self.B)
+            weight = (
+                head_weights.permute(1, 0, 2)
+                .contiguous()
+                .reshape(self.out_features, self.in_features)
+            )
+        expected = (self.out_features, self.in_features)
+        assert weight.shape == expected, (
+            f"effective weight shape {tuple(weight.shape)} does not match {expected}"
+        )
+        return weight
+
+    def forward(self, x):
+        if self.block_axis == "row":
+            hidden = torch.einsum("...i,hri->...hr", x, self.B)
+            out = torch.einsum("...hr,hdr->...hd", hidden, self.A)
+            out = out.reshape(*x.shape[:-1], self.out_features)
+        else:
+            x_by_head = x.reshape(*x.shape[:-1], self.num_heads, self.head_dim)
+            hidden = torch.einsum("...hd,hrd->...hr", x_by_head, self.B)
+            out_by_head = torch.einsum("...hr,hor->...ho", hidden, self.A)
+            out = out_by_head.sum(dim=-2)
+
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+    @classmethod
+    def from_linear(
+        cls,
+        linear_layer: nn.Linear,
+        rank: int,
+        num_heads: int,
+        head_dim: int,
+        block_axis: str,
+        method: str = "svd",
+    ):
+        layer = cls(
+            linear_layer.in_features,
+            linear_layer.out_features,
+            rank,
+            num_heads,
+            head_dim,
+            block_axis,
+            bias=linear_layer.bias is not None,
+        )
+
+        if method == "random":
+            pass
+        elif method == "svd":
+            with torch.no_grad():
+                if block_axis == "row":
+                    blocks = linear_layer.weight.data.view(
+                        num_heads, head_dim, linear_layer.in_features
+                    )
+                else:
+                    blocks = (
+                        linear_layer.weight.data.view(
+                            linear_layer.out_features, num_heads, head_dim
+                        )
+                        .permute(1, 0, 2)
+                        .contiguous()
+                    )
+
+                U, S, Vh = torch.linalg.svd(blocks, full_matrices=False)
+                sqrt_s = torch.sqrt(S[:, :rank])
+                layer.A.data.copy_(U[:, :, :rank] * sqrt_s.unsqueeze(1))
+                layer.B.data.copy_(sqrt_s.unsqueeze(2) * Vh[:, :rank, :])
+        else:
+            raise ValueError(
+                f"Unsupported per-head low-rank initialization method {method!r}"
+            )
+
+        if linear_layer.bias is not None:
+            layer.bias.data.copy_(linear_layer.bias.data)
+
+        return layer
+
+
 def replace_linear_with_lowrank(
     model: nn.Module,
     rank: int = None,
@@ -362,6 +543,8 @@ def replace_linear_with_lowrank(
     disable_c: bool = False,
     sanity_check: bool = False,
     w2_same_rank_as_w1w3: bool = False,
+    attention_factorization: str = "whole",
+    attention_per_head_rank: Optional[int] = None,
 ) -> nn.Module:
     """
     Replace Linear layers in a model with LowRankLinear layers
@@ -379,10 +562,27 @@ def replace_linear_with_lowrank(
         sanity_check: If True, configure for sanity checking (A=W, C=B=I)
         w2_same_rank_as_w1w3: If True, feed_forward.w2 uses
             rank_ratio * out_features instead of rank_ratio * in_features.
+        attention_factorization: "whole" keeps existing behavior. "per_head"
+            replaces attention Wq/Wk/Wv/Wo with PerHeadLowRankLinear.
+        attention_per_head_rank: Fixed rank per attention head. If None, uses
+            rank_ratio * head_dim.
 
     Returns:
         Modified model with low-rank Linear layers
     """
+    if attention_factorization not in {"whole", "per_head"}:
+        raise ValueError(
+            "attention_factorization must be 'whole' or 'per_head', got "
+            f"{attention_factorization!r}"
+        )
+    if attention_factorization == "per_head" and not disable_c:
+        raise ValueError(
+            "per-head attention low-rank currently supports AB factorization only; "
+            "pass disable_c=True"
+        )
+    if attention_per_head_rank is not None and attention_per_head_rank <= 0:
+        raise ValueError("attention_per_head_rank must be positive when set")
+
     if target_modules is None:
         target_modules = []
     if exclude_modules is None:
@@ -400,7 +600,62 @@ def replace_linear_with_lowrank(
             "rank_ratio must be between 0 and 1 (exclusive of 0, inclusive of 1)."
         )
 
+    def get_parent_module(name: str) -> tuple[nn.Module, str]:
+        *parent_path, attr_name = name.split(".")
+        parent = model
+        for p in parent_path:
+            parent = getattr(parent, p)
+        return parent, attr_name
+
+    def get_per_head_attention_spec(name: str, module: nn.Linear):
+        if attention_factorization != "per_head" or ".attention." not in name:
+            return None
+        parent, attr_name = get_parent_module(name)
+        if attr_name not in {"wq", "wk", "wv", "wo"}:
+            return None
+        if not all(
+            hasattr(parent, attr) for attr in ("n_heads", "n_kv_heads", "head_dim")
+        ):
+            raise ValueError(
+                f"Cannot infer attention head geometry for {name}; parent lacks "
+                "n_heads/n_kv_heads/head_dim"
+            )
+
+        if attr_name in {"wq", "wo"}:
+            num_heads = int(parent.n_heads)
+        else:
+            num_heads = int(parent.n_kv_heads)
+        head_dim = int(parent.head_dim)
+        block_axis = "column" if attr_name == "wo" else "row"
+        expected = num_heads * head_dim
+        actual = module.in_features if block_axis == "column" else module.out_features
+        if actual != expected:
+            raise ValueError(
+                f"{name} has incompatible shape for per-head factorization: "
+                f"expected {'in' if block_axis == 'column' else 'out'}_features "
+                f"{expected}, got {actual}"
+            )
+        per_head_rank = attention_per_head_rank
+        if per_head_rank is None:
+            if rank_ratio is None:
+                per_head_rank = rank
+            else:
+                per_head_rank = max(1, int(rank_ratio * head_dim))
+        per_head_rank = max(
+            1,
+            min(int(per_head_rank), head_dim, module.in_features, module.out_features),
+        )
+        return {
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "block_axis": block_axis,
+            "rank": per_head_rank,
+        }
+
     def calculate_layer_rank(name: str, module: nn.Linear) -> int:
+        per_head_spec = get_per_head_attention_spec(name, module)
+        if per_head_spec is not None:
+            return per_head_spec["rank"]
         if rank_ratio is None:
             return rank
         rank_features = module.in_features
@@ -467,9 +722,15 @@ def replace_linear_with_lowrank(
             marker = "✓" if name in modules_to_replace else " "
             if rank_ratio is not None:
                 calculated_rank = calculate_layer_rank(name, module)
-                rank_source = "out_features" if (
+                per_head_spec = get_per_head_attention_spec(name, module)
+                if per_head_spec is not None:
+                    rank_source = (
+                        f"per_head_{per_head_spec['block_axis']}_head_dim"
+                    )
+                else:
+                    rank_source = "out_features" if (
                     w2_same_rank_as_w1w3 and "feed_forward.w2" in name
-                ) else "in_features"
+                    ) else "in_features"
                 print(
                     f"  [{i:2d}] {marker} {name}: {module.weight.shape} -> rank {calculated_rank} (ratio={rank_ratio:.3f}, source={rank_source})"
                 )
@@ -481,10 +742,7 @@ def replace_linear_with_lowrank(
     # Replace modules
     for name, linear_module in modules_to_replace.items():
         # Navigate to parent module
-        *parent_path, attr_name = name.split(".")
-        parent = model
-        for p in parent_path:
-            parent = getattr(parent, p)
+        parent, attr_name = get_parent_module(name)
 
         # Calculate rank for this specific layer
         if rank_ratio is not None:
@@ -493,14 +751,30 @@ def replace_linear_with_lowrank(
             calculated_rank = rank
 
         # Create and set low-rank replacement
-        lr_module = LowRankLinear.from_linear(
-            linear_module,
-            calculated_rank,
-            method,
-            sanity_check=sanity_check,
-            rank_ratio=rank_ratio,
-            disable_c=disable_c,
-        )
+        per_head_spec = get_per_head_attention_spec(name, linear_module)
+        if per_head_spec is not None:
+            if sanity_check:
+                raise ValueError(
+                    "sanity_check_lowrank is not supported with per-head attention "
+                    "factorization"
+                )
+            lr_module = PerHeadLowRankLinear.from_linear(
+                linear_module,
+                rank=calculated_rank,
+                num_heads=per_head_spec["num_heads"],
+                head_dim=per_head_spec["head_dim"],
+                block_axis=per_head_spec["block_axis"],
+                method=method,
+            )
+        else:
+            lr_module = LowRankLinear.from_linear(
+                linear_module,
+                calculated_rank,
+                method,
+                sanity_check=sanity_check,
+                rank_ratio=rank_ratio,
+                disable_c=disable_c,
+            )
 
         setattr(parent, attr_name, lr_module)
 

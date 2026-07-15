@@ -1,8 +1,8 @@
 import torch
 
 def _l2_normalize(v, eps=1e-12):
-    """L2 normalize a tensor."""
-    return v / (v.norm() + eps)
+    """L2 normalize a tensor along its matrix-vector dimension."""
+    return v / (v.norm(dim=-1, keepdim=True) + eps)
 
 
 def _max_singular_value_power_iter_old(W, u, Ip=1):
@@ -34,9 +34,9 @@ def _max_singular_value_power_iter(W, u, Ip=1):
     _u = u
     for _ in range(Ip):
         _v = _l2_normalize(_u @ W)
-        _u = _l2_normalize(_v @ W.t())
+        _u = _l2_normalize(_v @ W.mT)
 
-    sigma = (_u @ W @ _v.t()).squeeze()
+    sigma = (_u @ W @ _v.mT).squeeze(-1).squeeze(-1)
     return sigma, _u, _v
 
 
@@ -102,14 +102,18 @@ def get_lowrank_spectral_norm_scaling(
                             torch.randn(expected_u_B_shape, device=module.B.device, dtype=module.u_B.dtype)
                         )
 
-                # Compute spectral norm of A using power iteration
+                # Compute spectral norm of A using power iteration. For per-head
+                # attention factors A/B are batched 3D tensors; use the max
+                # per-head spectral norm as the single scalar LR scale for the
+                # whole parameter tensor.
                 A_float = module.A.float()
                 sigma_A, new_u_A, v_A = _max_singular_value_power_iter(
                     A_float, module.u_A.float(), Ip=power_iter_steps
                 )
                 # Update u_A for next iteration
                 module.u_A.copy_(new_u_A)
-                A_spectral_norm = sigma_A.item()
+                A_spectral_tensor = sigma_A.reshape(-1)
+                A_spectral_norm = A_spectral_tensor.max().item()
 
                 # Compute spectral norm of B using power iteration
                 B_float = module.B.float()
@@ -118,7 +122,8 @@ def get_lowrank_spectral_norm_scaling(
                 )
                 # Update u_B for next iteration
                 module.u_B.copy_(new_u_B)
-                B_spectral_norm = sigma_B.item()
+                B_spectral_tensor = sigma_B.reshape(-1)
+                B_spectral_norm = B_spectral_tensor.max().item()
 
                 # Compute regularization gradients if spectral weight decay is enabled
                 # Store them separately for decoupled weight decay
@@ -133,11 +138,27 @@ def get_lowrank_spectral_norm_scaling(
                         # Gradient for A: λ * σ_A * (u_A^T @ v_A)
                         # Gradient for B: λ * σ_B * (u_B^T @ v_B)
 
-                        grad_A = spectral_weight_decay * A_spectral_norm * new_u_A.t() @ v_A
+                        sigma_A_for_grad = sigma_A.reshape(
+                            sigma_A.shape + (1, 1)
+                        )
+                        sigma_B_for_grad = sigma_B.reshape(
+                            sigma_B.shape + (1, 1)
+                        )
+                        grad_A = (
+                            spectral_weight_decay
+                            * sigma_A_for_grad
+                            * new_u_A.mT
+                            @ v_A
+                        )
                         grad_A = grad_A.to(module.A.dtype)
                         regularization_grads[a_param_name] = grad_A
 
-                        grad_B = spectral_weight_decay * B_spectral_norm * new_u_B.t() @ v_B
+                        grad_B = (
+                            spectral_weight_decay
+                            * sigma_B_for_grad
+                            * new_u_B.mT
+                            @ v_B
+                        )
                         grad_B = grad_B.to(module.B.dtype)
                         regularization_grads[b_param_name] = grad_B
 
@@ -151,11 +172,27 @@ def get_lowrank_spectral_norm_scaling(
                         # grad_A scaled by σ_B (instead of σ_A)
                         # grad_B scaled by σ_A (instead of σ_B)
 
-                        grad_A = spectral_weight_decay * B_spectral_norm**2 * new_u_A.t() @ v_A  # Scaled by σ_B^2
+                        sigma_A_for_grad = sigma_A.reshape(
+                            sigma_A.shape + (1, 1)
+                        )
+                        sigma_B_for_grad = sigma_B.reshape(
+                            sigma_B.shape + (1, 1)
+                        )
+                        grad_A = (
+                            spectral_weight_decay
+                            * sigma_B_for_grad**2
+                            * new_u_A.mT
+                            @ v_A
+                        )
                         grad_A = grad_A.to(module.A.dtype)
                         regularization_grads[a_param_name] = grad_A
 
-                        grad_B = spectral_weight_decay * A_spectral_norm**2 * new_u_B.t() @ v_B  # Scaled by σ_A^2
+                        grad_B = (
+                            spectral_weight_decay
+                            * sigma_A_for_grad**2
+                            * new_u_B.mT
+                            @ v_B
+                        )
                         grad_B = grad_B.to(module.B.dtype)
                         regularization_grads[b_param_name] = grad_B
 

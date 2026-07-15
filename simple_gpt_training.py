@@ -637,6 +637,10 @@ def main():
     parser.add_argument('--low_rank_ratio', type=float, default=0.25, help='Low-rank ratio for calculating rank as ratio * in_features (default: 0.25)')
     parser.add_argument('--low_rank_w2_same_rank_as_w1w3', action='store_true',
                         help='For feed_forward.w2, calculate low-rank rank from out_features instead of in_features')
+    parser.add_argument('--low_rank_attention_factorization', type=str, default='whole', choices=['whole', 'per_head'],
+                        help='Attention low-rank factorization mode. whole preserves existing behavior; per_head uses separate AB factors per attention head.')
+    parser.add_argument('--low_rank_attention_per_head_rank', type=int, default=None,
+                        help='Fixed per-head attention rank when low_rank_attention_factorization=per_head. Defaults to low_rank_ratio * head_dim.')
     parser.add_argument('--max_layers', type=int, default=None, help='Maximum number of layers to apply low-rank decomposition (default: all eligible layers)')
     parser.add_argument('--layer_indices', type=int, nargs='+', default=None, help='Specific layer indices to apply low-rank decomposition (0-based indexing)')
     parser.add_argument('--exclude_modules', type=str, nargs='+', default=['tok_embeddings','output'], help='Modules to exclude from low-rank decomposition')
@@ -725,6 +729,13 @@ def main():
         raise ValueError("--lowrank_ffn_lr_multiplier requires --low_rank")
     if args.lowrank_ffn_lr_multiplier != 1.0 and args.optimizer != "muon":
         raise ValueError("--lowrank_ffn_lr_multiplier is currently supported only with --optimizer muon")
+    if args.low_rank_attention_per_head_rank is not None and args.low_rank_attention_per_head_rank <= 0:
+        raise ValueError("--low_rank_attention_per_head_rank must be positive")
+    if args.low_rank_attention_factorization == "per_head":
+        if not args.low_rank:
+            raise ValueError("--low_rank_attention_factorization=per_head requires --low_rank")
+        if not args.disable_c:
+            raise ValueError("--low_rank_attention_factorization=per_head requires --disable_c")
     if not 0.0 <= args.warmup_start_factor <= 1.0:
         raise ValueError("--warmup_start_factor must be between 0 and 1")
     if args.checkpoint_interval_steps < 0:
@@ -799,6 +810,14 @@ def main():
     if args.low_rank:
         if rank == 0:
             print(f"Applying low-rank decomposition with ratio={args.low_rank_ratio}")
+            print(f"Attention low-rank factorization: {args.low_rank_attention_factorization}")
+            if args.low_rank_attention_factorization == "per_head":
+                rank_msg = (
+                    str(args.low_rank_attention_per_head_rank)
+                    if args.low_rank_attention_per_head_rank is not None
+                    else "rank_ratio * head_dim"
+                )
+                print(f"Attention per-head rank: {rank_msg}")
             print(f"Original model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
         model = replace_linear_with_lowrank(
@@ -811,6 +830,8 @@ def main():
             disable_c=args.disable_c,
             sanity_check=args.sanity_check_lowrank,
             w2_same_rank_as_w1w3=args.low_rank_w2_same_rank_as_w1w3,
+            attention_factorization=args.low_rank_attention_factorization,
+            attention_per_head_rank=args.low_rank_attention_per_head_rank,
         )
         model = model.to(device)
         if rank == 0:

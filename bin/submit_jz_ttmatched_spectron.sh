@@ -26,6 +26,8 @@ SUBMIT_NH_WEIGHT_DECAY="${NH_WEIGHT_DECAY:-$SUBMIT_WEIGHT_DECAY}"
 SUBMIT_MIN_LR_FACTOR="${MIN_LR_FACTOR:-0.0}"
 SUBMIT_LOW_RANK_RATIO="${LOW_RANK_RATIO:-0.25}"
 SUBMIT_LOW_RANK_W2_SAME_RANK="${LOW_RANK_W2_SAME_RANK_AS_W1W3:-0}"
+SUBMIT_LOW_RANK_ATTENTION_FACTORIZATION="${LOW_RANK_ATTENTION_FACTORIZATION:-whole}"
+SUBMIT_LOW_RANK_ATTENTION_PER_HEAD_RANK="${LOW_RANK_ATTENTION_PER_HEAD_RANK:-}"
 SUBMIT_LR_TAG="${SUBMIT_MAX_LR//./p}"
 SUBMIT_LR_TAG="${SUBMIT_LR_TAG//e-/em}"
 SUBMIT_LR_TAG="${SUBMIT_LR_TAG//e+/ep}"
@@ -81,6 +83,12 @@ if [[ "$RUN_MODE" != "fullrank" && "$SUBMIT_LOW_RANK_RATIO" != "0.25" && "$SUBMI
 fi
 if [[ "$RUN_MODE" != "fullrank" && "$SUBMIT_LOW_RANK_W2_SAME_RANK" == "1" ]]; then
   JOB_SUFFIX="${JOB_SUFFIX}_w2same"
+fi
+if [[ "$RUN_MODE" != "fullrank" && "$SUBMIT_LOW_RANK_ATTENTION_FACTORIZATION" == "per_head" ]]; then
+  JOB_SUFFIX="${JOB_SUFFIX}_attnperhead"
+  if [[ -n "$SUBMIT_LOW_RANK_ATTENTION_PER_HEAD_RANK" ]]; then
+    JOB_SUFFIX="${JOB_SUFFIX}r${SUBMIT_LOW_RANK_ATTENTION_PER_HEAD_RANK}"
+  fi
 fi
 JOB_NAME="spectron_tt134m_${SUBMIT_OPTIMIZER}_${RUN_MODE}_lr${SUBMIT_LR_TAG}_wd${SUBMIT_WD_TAG}_steps${JOB_STEPS}_sched${JOB_SCHEDULE_STEPS}${JOB_SUFFIX}"
 JOB_SCRIPT="$JOB_DIR/${JOB_NAME}_${PROFILE}_${RUN_STAMP}.slurm"
@@ -209,6 +217,8 @@ SWD_TYPE="\${SWD_TYPE:-standard}"
 MIN_LR_FACTOR="\${MIN_LR_FACTOR:-$SUBMIT_MIN_LR_FACTOR}"
 LOW_RANK_RATIO="\${LOW_RANK_RATIO:-$SUBMIT_LOW_RANK_RATIO}"
 LOW_RANK_W2_SAME_RANK_AS_W1W3="\${LOW_RANK_W2_SAME_RANK_AS_W1W3:-$SUBMIT_LOW_RANK_W2_SAME_RANK}"
+LOW_RANK_ATTENTION_FACTORIZATION="\${LOW_RANK_ATTENTION_FACTORIZATION:-$SUBMIT_LOW_RANK_ATTENTION_FACTORIZATION}"
+LOW_RANK_ATTENTION_PER_HEAD_RANK="\${LOW_RANK_ATTENTION_PER_HEAD_RANK:-$SUBMIT_LOW_RANK_ATTENTION_PER_HEAD_RANK}"
 WARMUP_START_FACTOR="\${WARMUP_START_FACTOR:-0.0}"
 SKIP_FINAL_EVAL="\${SKIP_FINAL_EVAL:-1}"
 LR_TAG="\${MAX_LR//./p}"
@@ -267,6 +277,12 @@ fi
 if [[ "\$RUN_MODE" != "fullrank" && "\$LOW_RANK_W2_SAME_RANK_AS_W1W3" == "1" ]]; then
   RUN_SUFFIX="\${RUN_SUFFIX}_w2same"
 fi
+if [[ "\$RUN_MODE" != "fullrank" && "\$LOW_RANK_ATTENTION_FACTORIZATION" == "per_head" ]]; then
+  RUN_SUFFIX="\${RUN_SUFFIX}_attnperhead"
+  if [[ -n "\$LOW_RANK_ATTENTION_PER_HEAD_RANK" ]]; then
+    RUN_SUFFIX="\${RUN_SUFFIX}r\${LOW_RANK_ATTENTION_PER_HEAD_RANK}"
+  fi
+fi
 RUN_NAME="\${RUN_NAME:-spectron_tt134m_fineweb_\${OPTIMIZER}_lr\${LR_TAG}_wd\${WD_TAG}_seq2048_steps\${TOTAL_STEPS}_sched\${LR_SCHEDULE_STEPS}_rope10000_\${RUN_MODE}\${RUN_SUFFIX}}"
 mkdir -p "\$WANDB_DIR"
 export WANDB_DIR
@@ -304,6 +320,12 @@ esac
 if [[ "\$LOW_RANK_W2_SAME_RANK_AS_W1W3" == "1" ]]; then
   LOW_RANK_FLAGS+=(--low_rank_w2_same_rank_as_w1w3)
 fi
+if [[ "\$LOW_RANK_ATTENTION_FACTORIZATION" != "whole" ]]; then
+  LOW_RANK_FLAGS+=(--low_rank_attention_factorization "\$LOW_RANK_ATTENTION_FACTORIZATION")
+fi
+if [[ -n "\$LOW_RANK_ATTENTION_PER_HEAD_RANK" ]]; then
+  LOW_RANK_FLAGS+=(--low_rank_attention_per_head_rank "\$LOW_RANK_ATTENTION_PER_HEAD_RANK")
+fi
 
 FINAL_EVAL_FLAGS=()
 if [[ "\$SKIP_FINAL_EVAL" == "1" ]]; then
@@ -336,6 +358,7 @@ echo "  use_flex_attn=\$USE_FLEX_ATTN tt_style_init=\$TT_STYLE_INIT"
 echo "  spectral_lr_scaling=\$SPECTRAL_LR_SCALING spectral_lr_scaling_offset=\$SPECTRAL_LR_SCALING_OFFSET spectral_lr_target=\$SPECTRAL_LR_TARGET spectral_weight_decay=\$SPECTRAL_WEIGHT_DECAY swd_type=\$SWD_TYPE"
 echo "  lowrank_ffn_lr_multiplier=\$LOWRANK_FFN_LR_MULTIPLIER"
 echo "  low_rank_ratio=\$LOW_RANK_RATIO low_rank_w2_same_rank_as_w1w3=\$LOW_RANK_W2_SAME_RANK_AS_W1W3"
+echo "  low_rank_attention_factorization=\$LOW_RANK_ATTENTION_FACTORIZATION low_rank_attention_per_head_rank=\${LOW_RANK_ATTENTION_PER_HEAD_RANK:-auto}"
 echo "  log_interval=\$LOG_INTERVAL eval_interval=\$EVAL_INTERVAL skip_final_eval=\$SKIP_FINAL_EVAL"
 echo "  data_root=\$DATA_ROOT"
 echo "  run_name=\$RUN_NAME"
@@ -377,6 +400,7 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" --master_port "\$MASTER_PORT" 
   "\${ATTN_FLAGS[@]}" \\
   "\${INIT_FLAGS[@]}" \\
   "\${SPECTRAL_FLAGS[@]}" \\
+  "\${LOW_RANK_FLAGS[@]}" \\
   --spectral_lr_scaling_offset "\$SPECTRAL_LR_SCALING_OFFSET" \\
   --spectral_lr_target "\$SPECTRAL_LR_TARGET" \\
   --lowrank_ffn_lr_multiplier "\$LOWRANK_FFN_LR_MULTIPLIER" \\
@@ -392,8 +416,7 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" --master_port "\$MASTER_PORT" 
   --wandb_project "\$WANDB_PROJECT" \\
   --wandb_entity "\$WANDB_ENTITY" \\
   --run_name "\$RUN_NAME" \\
-  "\${FINAL_EVAL_FLAGS[@]}" \\
-  "\${LOW_RANK_FLAGS[@]}"
+  "\${FINAL_EVAL_FLAGS[@]}"
 EOF
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
