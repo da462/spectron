@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 import torch.distributed as dist
 import wandb
@@ -18,8 +19,10 @@ from pathlib import Path
 from power_iter import get_lowrank_spectral_norm_scaling
 from matrix_analysis import compute_matrix_metrics
 from optimizer_routing import (
+    LOWRANK_LR_TRACK_MODULE_CHOICES,
     SPECTRAL_LR_TARGET_CHOICES,
     apply_lowrank_lr_overrides,
+    collect_lowrank_lr_records,
     lowrank_decoupled_weight_decay_lr,
     lowrank_lr_multiplier_for_param,
     lowrank_module_type,
@@ -239,6 +242,77 @@ def prune_step_checkpoints(checkpoint_dir: str, keep_latest_k: int) -> None:
             print(f"Removed old step checkpoint: {checkpoint_path}")
         except OSError as exc:
             print(f"Warning: failed to remove old step checkpoint {checkpoint_path}: {exc}")
+
+
+def _median(values: list[float]) -> float:
+    sorted_values = sorted(values)
+    midpoint = len(sorted_values) // 2
+    if len(sorted_values) % 2:
+        return sorted_values[midpoint]
+    return 0.5 * (sorted_values[midpoint - 1] + sorted_values[midpoint])
+
+
+def log_lowrank_lr_records(
+    records: list[dict],
+    *,
+    step: int,
+    run_name: str | None,
+    jsonl_path: str | None,
+) -> None:
+    if not records:
+        return
+
+    actual_lrs = [float(record["actual_lr"]) for record in records]
+    if not all(math.isfinite(lr) for lr in actual_lrs):
+        raise RuntimeError(f"Non-finite low-rank LR detected at step {step}")
+
+    row_prefix = {"step": int(step), "run_name": run_name}
+    if jsonl_path is not None:
+        Path(jsonl_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(jsonl_path, "a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps({**row_prefix, **record}) + "\n")
+
+    log_dict = {
+        "step": step,
+        "lowrank_lr_summary/count": len(actual_lrs),
+        "lowrank_lr_summary/min": min(actual_lrs),
+        "lowrank_lr_summary/median": _median(actual_lrs),
+        "lowrank_lr_summary/max": max(actual_lrs),
+    }
+    expected_errors = [
+        abs(float(record["actual_lr"]) - float(record["expected_lr"]))
+        for record in records
+        if record.get("expected_lr") is not None
+    ]
+    if expected_errors:
+        log_dict["lowrank_lr_summary/max_expected_abs_error"] = max(expected_errors)
+
+    for factor in ("A", "B"):
+        factor_lrs = [
+            float(record["actual_lr"])
+            for record in records
+            if record["factor"] == factor
+        ]
+        if factor_lrs:
+            log_dict[f"lowrank_lr_summary/{factor}_median"] = _median(factor_lrs)
+
+    for record in records:
+        prefix = (
+            f"lowrank_lr/layer_{record['layer']}_"
+            f"{record['module_type']}_{record['matrix']}_{record['factor']}"
+        )
+        log_dict[prefix] = float(record["actual_lr"])
+        if record.get("spectral_scale") is not None:
+            log_dict[f"{prefix}_spectral_scale"] = float(record["spectral_scale"])
+
+    wandb.log(log_dict)
+    print(
+        f"Low-rank LR step {step}: count={len(actual_lrs)} "
+        f"min={min(actual_lrs):.6g} median={_median(actual_lrs):.6g} "
+        f"max={max(actual_lrs):.6g}"
+        + (f" jsonl={jsonl_path}" if jsonl_path else "")
+    )
 
 
 def load_checkpoint(
@@ -660,6 +734,13 @@ def main():
                         help='Override decoupled weight decay for FFN low-rank factors')
     parser.add_argument('--lowrank_attention_weight_decay', type=float, default=None,
                         help='Override decoupled weight decay for attention low-rank factors')
+    parser.add_argument('--track_lowrank_lr_interval', type=int, default=0,
+                        help='Log actual low-rank factor optimizer LRs every N steps; 0 disables')
+    parser.add_argument('--track_lowrank_lr_jsonl', type=str, default=None,
+                        help='Optional JSONL path for actual low-rank LR rows')
+    parser.add_argument('--track_lowrank_lr_module_type', type=str, default='ffn',
+                        choices=LOWRANK_LR_TRACK_MODULE_CHOICES,
+                        help='Which low-rank factors to include in LR diagnostics')
     parser.add_argument('--spectral_weight_decay', type=float, default=0.0,
                         help='Spectral norm weight decay coefficient (default: 0.0, disabled)')
     parser.add_argument('--swd_type', type=str, default='standard', choices=['standard', 'product'],
@@ -749,6 +830,17 @@ def main():
         raise ValueError("Low-rank weight decay overrides require --low_rank")
     if lowrank_weight_decay_overridden and args.optimizer != "muon":
         raise ValueError("Low-rank weight decay overrides are currently supported only with --optimizer muon")
+    if args.track_lowrank_lr_interval < 0:
+        raise ValueError("--track_lowrank_lr_interval must be non-negative")
+    if args.track_lowrank_lr_interval > 0:
+        if not args.low_rank:
+            raise ValueError("--track_lowrank_lr_interval requires --low_rank")
+        if args.optimizer != "muon":
+            raise ValueError("--track_lowrank_lr_interval is currently supported only with --optimizer muon")
+        if args.track_lowrank_lr_jsonl is None:
+            args.track_lowrank_lr_jsonl = os.path.join(
+                args.checkpoint_dir, "lowrank_lr.jsonl"
+            )
     if args.low_rank_attention_per_head_rank is not None and args.low_rank_attention_per_head_rank <= 0:
         raise ValueError("--low_rank_attention_per_head_rank must be positive")
     if args.low_rank_attention_factorization == "per_head":
@@ -1173,6 +1265,13 @@ def main():
             print(f"  Low-rank FFN weight decay override: {args.lowrank_ffn_weight_decay}")
         if args.lowrank_attention_weight_decay is not None:
             print(f"  Low-rank attention weight decay override: {args.lowrank_attention_weight_decay}")
+        if args.track_lowrank_lr_interval > 0:
+            print(
+                "  Tracking low-rank factor LRs: "
+                f"every {args.track_lowrank_lr_interval} steps, "
+                f"module_type={args.track_lowrank_lr_module_type}, "
+                f"jsonl={args.track_lowrank_lr_jsonl}"
+            )
         print()
 
     # Private params storage and per-virtual optimizers
@@ -1439,6 +1538,13 @@ def main():
             print(f"  Resuming from: {args.resume_from}")
         print()
 
+        if args.track_lowrank_lr_interval > 0 and args.track_lowrank_lr_jsonl:
+            lowrank_lr_path = Path(args.track_lowrank_lr_jsonl)
+            lowrank_lr_path.parent.mkdir(parents=True, exist_ok=True)
+            if start_step == 0:
+                lowrank_lr_path.write_text("", encoding="utf-8")
+            print(f"Low-rank LR JSONL: {lowrank_lr_path}")
+
     while step < args.total_steps:
         # Reset shared grads only at the beginning of the global step
         for p in shared_params_list:
@@ -1579,6 +1685,7 @@ def main():
         grad_norm = torch.nn.utils.clip_grad_norm_(shared_params_list, max_norm=1.0)
 
         base_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else args.max_lr
+        spectral_scaling = {}
 
         # Apply low-rank LR routing and/or spectral weight decay if enabled
         if use_lowrank_individual_groups or args.spectral_weight_decay > 0:
@@ -1651,6 +1758,34 @@ def main():
                         )
                         for param in pg['params']:
                             param.mul_(1 - lowrank_weight_decay * decay_lr)
+
+        if (
+            rank == 0
+            and args.track_lowrank_lr_interval > 0
+            and step % args.track_lowrank_lr_interval == 0
+        ):
+            lowrank_lr_records = collect_lowrank_lr_records(
+                model.named_parameters(),
+                shared_optimizer.param_groups,
+                base_lr=base_lr,
+                lowrank_ffn_lr_multiplier=args.lowrank_ffn_lr_multiplier,
+                spectral_scaling=spectral_scaling,
+                spectral_lr_target=args.spectral_lr_target,
+                apply_spectral_lr_scaling=args.spectral_lr_scaling,
+                module_type_filter=args.track_lowrank_lr_module_type,
+            )
+            if not lowrank_lr_records:
+                print(
+                    f"Warning: no low-rank LR records found at step {step} "
+                    f"for module_type={args.track_lowrank_lr_module_type}"
+                )
+            else:
+                log_lowrank_lr_records(
+                    lowrank_lr_records,
+                    step=step,
+                    run_name=args.run_name,
+                    jsonl_path=args.track_lowrank_lr_jsonl,
+                )
 
         # Step shared optimizer once per global step
         shared_optimizer.step()
