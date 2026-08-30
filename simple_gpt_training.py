@@ -31,6 +31,52 @@ from optimizer_routing import (
 # Base seed for reproducibility. Keep the historical default unless a run
 # explicitly overrides it.
 BASE_SEED = 1337
+CHECKPOINT_FORMAT_VERSION = 2
+
+RESUME_CRITICAL_ARGS = (
+    "train_files",
+    "train_seq_len",
+    "batch_size",
+    "micro_batch_size",
+    "virtual_workers_per_gpu",
+    "seed",
+    "optimizer",
+    "scheduler",
+    "lr_schedule_steps",
+    "warmup_steps",
+    "max_lr",
+    "weight_decay",
+    "adam_beta1",
+    "adam_beta2",
+    "adjust_muon_lr",
+    "bf16",
+    "vocab_size",
+    "num_layers",
+    "num_heads",
+    "n_kv_heads",
+    "hidden_size",
+    "multiple_of",
+    "ffn_dim_multiplier",
+    "max_position_embeddings",
+    "rope_theta",
+    "tt_style_init",
+    "low_rank",
+    "low_rank_ratio",
+    "disable_c",
+    "exclude_modules",
+    "low_rank_attention_factorization",
+    "low_rank_attention_per_head_rank",
+    "lowrank_ffn_lr_multiplier",
+    "spectral_lr_scaling",
+    "spectral_lr_target",
+    "spectral_lr_scaling_offset",
+    "lowrank_ffn_weight_decay",
+    "lowrank_attention_weight_decay",
+    "stochastic_depth",
+    "stochastic_depth_mode",
+    "num_overlaps",
+    "block_selection_seed",
+)
 
 # Conditional import for Muon optimizer
 try:
@@ -39,6 +85,84 @@ try:
 except ImportError:
     MUON_AVAILABLE = False
     print("Warning: Muon optimizer not available. Install with: pip install muon")
+
+
+def capture_rng_state(device=None) -> dict:
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        cuda_device = torch.cuda.current_device() if device is None else device
+        state["torch_cuda"] = torch.cuda.get_rng_state(cuda_device)
+    return state
+
+
+def restore_rng_state(state: dict | None, device=None) -> None:
+    if not state:
+        return
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"].cpu())
+    if "torch_cuda" in state and torch.cuda.is_available():
+        cuda_device = torch.cuda.current_device() if device is None else device
+        torch.cuda.set_rng_state(state["torch_cuda"].cpu(), cuda_device)
+
+
+def collect_rng_states(device=None) -> list[dict]:
+    local_state = capture_rng_state(device)
+    if not dist.is_available() or not dist.is_initialized():
+        return [local_state]
+    states = [None] * dist.get_world_size()
+    dist.all_gather_object(states, local_state)
+    return states
+
+
+def validate_resume_compatibility(
+    checkpoint: dict,
+    args: argparse.Namespace,
+    world_size: int,
+    virtual_world_size: int,
+) -> None:
+    saved_args = checkpoint.get("args", {})
+    mismatches = []
+    for name in RESUME_CRITICAL_ARGS:
+        if name not in saved_args or not hasattr(args, name):
+            continue
+        saved_value = saved_args[name]
+        current_value = getattr(args, name)
+        if saved_value != current_value:
+            mismatches.append(f"{name}: checkpoint={saved_value!r}, current={current_value!r}")
+
+    resume_state = checkpoint.get("resume_state", {})
+    saved_world_size = resume_state.get("world_size")
+    saved_virtual_world_size = resume_state.get("virtual_world_size")
+
+    # Older checkpoints did not store topology explicitly, but their token
+    # counters encode the virtual world size used during training.
+    if saved_virtual_world_size is None:
+        rank0_tokens = checkpoint.get("total_tokens_rank0", 0)
+        world_tokens = checkpoint.get("total_tokens_world", 0)
+        if rank0_tokens and world_tokens % rank0_tokens == 0:
+            saved_virtual_world_size = world_tokens // rank0_tokens
+
+    if saved_world_size is not None and saved_world_size != world_size:
+        mismatches.append(
+            f"world_size: checkpoint={saved_world_size}, current={world_size}"
+        )
+    if (
+        saved_virtual_world_size is not None
+        and saved_virtual_world_size != virtual_world_size
+    ):
+        mismatches.append(
+            "virtual_world_size: "
+            f"checkpoint={saved_virtual_world_size}, current={virtual_world_size}"
+        )
+
+    if mismatches:
+        details = "\n  ".join(mismatches)
+        raise ValueError(f"Checkpoint is incompatible with this run:\n  {details}")
 
 
 def wsd_schedule(
@@ -145,7 +269,12 @@ def save_checkpoint(
     best_val_loss: float = float('inf'),
     is_final: bool = False,
     is_best: bool = False,
-    alpha_scheduler = None
+    alpha_scheduler=None,
+    train_batches_consumed_per_worker: int = 0,
+    accumulation_steps: int = 1,
+    world_size: int = 1,
+    virtual_world_size: int = 1,
+    rng_states_by_rank: list[dict] | None = None,
 ):
     """
     Save a training checkpoint.
@@ -181,6 +310,7 @@ def save_checkpoint(
 
     # Prepare checkpoint data
     checkpoint = {
+        'checkpoint_format_version': CHECKPOINT_FORMAT_VERSION,
         'step': step,
         'model_state_dict': model.state_dict(),
         'model_args': vars(model_args) if hasattr(model_args, '__dict__') else model_args,
@@ -194,6 +324,17 @@ def save_checkpoint(
         'best_val_loss': best_val_loss,
         'args': vars(args),
         'timestamp': datetime.now().isoformat(),
+        'resume_state': {
+            'train_batches_consumed_per_worker': train_batches_consumed_per_worker,
+            'accumulation_steps': accumulation_steps,
+            'world_size': world_size,
+            'virtual_world_size': virtual_world_size,
+        },
+        'rng_states_by_rank': (
+            rng_states_by_rank
+            if rng_states_by_rank is not None
+            else [capture_rng_state()]
+        ),
     }
 
     # Save self-guided state if enabled
@@ -219,8 +360,15 @@ def save_checkpoint(
         private_param_store_serializable[vw] = {k: v.cpu() for k, v in params_dict.items()}
     checkpoint['private_param_store'] = private_param_store_serializable
 
-    # Save checkpoint
-    torch.save(checkpoint, checkpoint_path)
+    # Publish checkpoints atomically so a timeout during serialization leaves
+    # only an ignored temporary file, never a corrupt resumable path.
+    temporary_path = f"{checkpoint_path}.tmp-{os.getpid()}"
+    try:
+        torch.save(checkpoint, temporary_path)
+        os.replace(temporary_path, checkpoint_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
     print(f"Checkpoint saved to {checkpoint_path} at step {step}")
 
     return checkpoint_path
@@ -322,7 +470,11 @@ def load_checkpoint(
     private_optimizers: dict,
     private_param_store: dict,
     scheduler,
-    device: torch.device
+    device: torch.device,
+    args: argparse.Namespace | None = None,
+    rank: int = 0,
+    world_size: int = 1,
+    virtual_world_size: int = 1,
 ):
     """
     Load a training checkpoint and resume training.
@@ -340,11 +492,25 @@ def load_checkpoint(
         Dictionary containing checkpoint metadata (step, tokens, flops, etc.)
     """
     if not os.path.exists(checkpoint_path):
-        print(f"Checkpoint not found at {checkpoint_path}")
-        return None
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
 
     print(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=f"cuda:{device}")
+    map_location = f"cuda:{device}" if isinstance(device, int) else device
+    # These are trusted, locally produced training checkpoints containing
+    # optimizer and RNG objects in addition to tensor weights.
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=map_location,
+        weights_only=False,
+    )
+
+    if args is not None:
+        validate_resume_compatibility(
+            checkpoint,
+            args,
+            world_size=world_size,
+            virtual_world_size=virtual_world_size,
+        )
 
     # Load model state
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -388,7 +554,22 @@ def load_checkpoint(
         'wandb_run_name': checkpoint.get('wandb_run_name', None),
         'self_guided_phase': checkpoint.get('self_guided_phase', None),
         'current_alpha': checkpoint.get('current_alpha', None),
+        'train_batches_consumed_per_worker': checkpoint.get(
+            'resume_state', {}
+        ).get('train_batches_consumed_per_worker'),
+        'saved_accumulation_steps': checkpoint.get('resume_state', {}).get(
+            'accumulation_steps'
+        ),
+        'rng_state': None,
     }
+
+    rng_states_by_rank = checkpoint.get('rng_states_by_rank')
+    if rng_states_by_rank:
+        if rank >= len(rng_states_by_rank):
+            raise ValueError(
+                f"Checkpoint has {len(rng_states_by_rank)} RNG states, cannot restore rank {rank}"
+            )
+        metadata['rng_state'] = rng_states_by_rank[rank]
 
     print(f"Resuming from step {metadata['start_step']}")
     if metadata['self_guided_phase'] is not None:
@@ -898,6 +1079,8 @@ def main():
     local_virtual_worker_indices = list(range(first_virtual_worker_index, first_virtual_worker_index + virtual_workers_per_gpu))
     if rank == 0:
         print(f"Using virtual workers per GPU: {virtual_workers_per_gpu}. Virtual world size: {virtual_world_size}")
+    if args.micro_batch_size is None:
+        args.micro_batch_size = max(1, args.batch_size // virtual_world_size)
 
     # Create model and criterion
     model_args = TitanModelArgs(
@@ -1083,20 +1266,6 @@ def main():
         all_param_names = [name for name, _ in model.named_parameters()]
         shared_param_names = set(all_param_names)
         private_params_by_virtual_worker = {vw: [] for vw in range(virtual_world_size)}
-
-    # Create per-virtual-worker dataloaders for training; validation stays on rank 0
-    # To avoid GPU OOM when simulating multiple virtual workers on one GPU, keep datasets on CPU
-    dataset_device = 'cpu' if virtual_workers_per_gpu > 1 else f"cuda:{local_rank}"
-    dataset_device = 'cpu' # Always use CPU for datasets to minimize GPU memory usage
-
-    virtual_train_iterators = {}
-    validation_loader = None
-    for vw in local_virtual_worker_indices:
-        train_loader_vw, val_loader_vw = create_dataloaders(args, vw, virtual_world_size, device=dataset_device)
-        virtual_train_iterators[vw] = iter(train_loader_vw)
-        # Capture validation_loader from the first virtual worker (only created on rank 0)
-        if validation_loader is None and val_loader_vw is not None:
-            validation_loader = val_loader_vw
 
     # Create optimizers: one for shared params, and one per local VIRTUAL worker for private params
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
@@ -1365,41 +1534,34 @@ def main():
     start_step = 0
     checkpoint_metadata = None
     if args.resume_from:
-        # All ranks must load the checkpoint to get model weights and optimizer state
-        try:
-            checkpoint_metadata = load_checkpoint(
-                args.resume_from,
-                model,
-                shared_optimizer,
-                private_optimizers,
-                private_param_store,
-                scheduler,
-                device
+        # An explicit resume must succeed on every rank. Silently falling back
+        # to step zero can overwrite logs and invalidate a chained experiment.
+        checkpoint_metadata = load_checkpoint(
+            args.resume_from,
+            model,
+            shared_optimizer,
+            private_optimizers,
+            private_param_store,
+            scheduler,
+            device,
+            args=args,
+            rank=rank,
+            world_size=world_size,
+            virtual_world_size=virtual_world_size,
+        )
+        start_step = checkpoint_metadata['start_step']
+
+        start_step_min = torch.tensor(start_step, device=device)
+        start_step_max = torch.tensor(start_step, device=device)
+        dist.all_reduce(start_step_min, op=dist.ReduceOp.MIN)
+        dist.all_reduce(start_step_max, op=dist.ReduceOp.MAX)
+        if start_step_min.item() != start_step_max.item():
+            raise RuntimeError(
+                "Ranks loaded different checkpoint steps: "
+                f"min={start_step_min.item()}, max={start_step_max.item()}"
             )
-            if checkpoint_metadata is not None:
-                start_step = checkpoint_metadata['start_step']
-                if rank == 0:
-                    print(f"✓ Successfully loaded checkpoint, resuming from step {start_step}")
-            else:
-                if rank == 0:
-                    print(f"WARNING: Failed to load checkpoint from {args.resume_from}")
-                    print("Starting training from scratch instead")
-        except Exception as e:
-            if rank == 0:
-                print(f"ERROR: Exception while loading checkpoint: {e}")
-                print("Starting training from scratch instead")
-            checkpoint_metadata = None
-
-        # Synchronize start_step across all ranks (in case of load failures)
-        start_step_tensor = torch.tensor(start_step, device=device)
-        dist.all_reduce(start_step_tensor, op=dist.ReduceOp.MAX)
-        start_step = int(start_step_tensor.item())
-
         if rank == 0:
-            if start_step > 0:
-                print(f"All ranks resuming from step {start_step}")
-            else:
-                print(f"All ranks starting from scratch (checkpoint loading failed)")
+            print(f"Successfully loaded checkpoint; all ranks resume at step {start_step}")
 
     # Initialize wandb (only on rank 0)
     if rank == 0:
@@ -1511,14 +1673,79 @@ def main():
     checkpoint_interval_seconds = args.checkpoint_interval_hours * 3600  # Convert hours to seconds
 
     # Gradient accumulation setup (distribute global batch across VIRTUAL world)
-    if args.micro_batch_size is None:
-        args.micro_batch_size = max(1, args.batch_size // virtual_world_size)
     effective_per_step = args.micro_batch_size * virtual_world_size
     accumulation_steps = max(1, args.batch_size // effective_per_step)
+    saved_accumulation_steps = (
+        checkpoint_metadata.get('saved_accumulation_steps')
+        if checkpoint_metadata
+        else None
+    )
+    if (
+        saved_accumulation_steps is not None
+        and saved_accumulation_steps != accumulation_steps
+    ):
+        raise ValueError(
+            "Gradient accumulation changed across resume: "
+            f"checkpoint={saved_accumulation_steps}, current={accumulation_steps}"
+        )
+
+    if checkpoint_metadata:
+        train_batches_consumed_per_worker = checkpoint_metadata.get(
+            'train_batches_consumed_per_worker'
+        )
+        if train_batches_consumed_per_worker is None:
+            train_batches_consumed_per_worker = start_step * accumulation_steps
+            if rank == 0:
+                print(
+                    "Legacy checkpoint has no data cursor; deriving it as "
+                    f"{start_step} completed steps * {accumulation_steps} "
+                    f"micro-batches = {train_batches_consumed_per_worker} batches"
+                )
+    else:
+        train_batches_consumed_per_worker = 0
+
     if rank == 0:
         if args.batch_size % effective_per_step != 0:
             print(f"[Warn] Global batch {args.batch_size} not divisible by micro_batch_size*virtual_world_size ({effective_per_step}). Using floor division: accumulation_steps={accumulation_steps}")
         print(f"Gradient accumulation: {accumulation_steps} micro-batches per update; micro_batch_size={args.micro_batch_size}, virtual_world_size={virtual_world_size}")
+
+    # Construct iterators only after the checkpoint step and accumulation
+    # factor are known, then seek each sequential shard to its exact batch.
+    dataset_device = 'cpu'
+    virtual_train_iterators = {}
+    validation_loader = None
+    for vw in local_virtual_worker_indices:
+        train_loader_vw, val_loader_vw = create_dataloaders(
+            args,
+            vw,
+            virtual_world_size,
+            device=dataset_device,
+            train_batches_consumed=train_batches_consumed_per_worker,
+        )
+        virtual_train_iterators[vw] = iter(train_loader_vw)
+        if rank == 0:
+            print(
+                f"Virtual worker {vw} data resume: "
+                f"consumed_batches={train_batches_consumed_per_worker}, "
+                f"batch_offset={train_loader_vw.resume_batch_offset}, "
+                f"sample_offset={train_loader_vw.resume_sample_offset}"
+            )
+        if validation_loader is None and val_loader_vw is not None:
+            validation_loader = val_loader_vw
+
+    # Startup (model construction, checkpoint loading, W&B and DataLoader
+    # construction) may consume RNG. Restore the saved training RNG last.
+    if checkpoint_metadata:
+        if checkpoint_metadata.get('rng_state') is None:
+            if rank == 0:
+                print(
+                    "Warning: legacy checkpoint has no RNG state. The data "
+                    "cursor is exact, but stochastic layers cannot replay exactly."
+                )
+        else:
+            restore_rng_state(checkpoint_metadata['rng_state'], device)
+            if rank == 0:
+                print("Restored Python, NumPy, Torch CPU, and CUDA RNG state")
 
     print(f"Worker {rank} starting training...")
     if args.scheduler == 'wsd':
@@ -1791,6 +2018,7 @@ def main():
         shared_optimizer.step()
 
         scheduler.step()
+        train_batches_consumed_per_worker += accumulation_steps
 
         # Update self-guided alpha and handle phase transition
         if args.self_guided and alpha_scheduler is not None:
@@ -1931,6 +2159,7 @@ def main():
         # step without forcing validation.
         should_log = args.log_interval > 0 and step % args.log_interval == 0
         should_eval = args.eval_interval > 0 and step > 0 and step % args.eval_interval == 0
+        save_best_checkpoint_this_step = False
         if should_log or should_eval:
             lr = shared_optimizer.param_groups[0]['lr']
 
@@ -1983,31 +2212,11 @@ def main():
 
                         # Save best checkpoint (only if enabled)
                         if args.save_best_checkpoint:
+                            save_best_checkpoint_this_step = True
                             print(f"\n{'='*80}")
                             print(f"New best validation loss: {best_val_loss:.4f} at step {step}")
-                            print(f"Saving best checkpoint...")
+                            print("Preparing best checkpoint...")
                             print(f"{'='*80}\n")
-
-                            best_checkpoint_path = save_checkpoint(
-                                checkpoint_dir=args.checkpoint_dir,
-                                model=model,
-                                model_args=model_args,
-                                shared_optimizer=shared_optimizer,
-                                private_optimizers=private_optimizers,
-                                private_param_store=private_param_store,
-                                scheduler=scheduler,
-                                step=step,
-                                total_tokens_rank0=total_tokens_rank0,
-                                total_tokens_world=total_tokens_world,
-                                total_flops=total_flops,
-                                total_flops_forward=total_flops_forward,
-                                total_flops_backward=total_flops_backward,
-                                args=args,
-                                best_val_loss=best_val_loss,
-                                is_final=False,
-                                is_best=True,
-                                alpha_scheduler=alpha_scheduler
-                            )
                         else:
                             print(
                                 f"New best validation loss: {best_val_loss:.4f} at step {step} (checkpoint saving disabled)"
@@ -2034,7 +2243,44 @@ def main():
             if should_eval:
                 dist.barrier()
 
+        if should_eval and args.save_best_checkpoint:
+            save_best_tensor = torch.tensor(
+                int(rank == 0 and save_best_checkpoint_this_step),
+                device=device,
+            )
+            dist.broadcast(save_best_tensor, src=0)
+            if save_best_tensor.item():
+                rng_states_by_rank = collect_rng_states(device)
+                if rank == 0:
+                    save_checkpoint(
+                        checkpoint_dir=args.checkpoint_dir,
+                        model=model,
+                        model_args=model_args,
+                        shared_optimizer=shared_optimizer,
+                        private_optimizers=private_optimizers,
+                        private_param_store=private_param_store,
+                        scheduler=scheduler,
+                        step=step,
+                        total_tokens_rank0=total_tokens_rank0,
+                        total_tokens_world=total_tokens_world,
+                        total_flops=total_flops,
+                        total_flops_forward=total_flops_forward,
+                        total_flops_backward=total_flops_backward,
+                        args=args,
+                        best_val_loss=best_val_loss,
+                        is_final=False,
+                        is_best=True,
+                        alpha_scheduler=alpha_scheduler,
+                        train_batches_consumed_per_worker=train_batches_consumed_per_worker,
+                        accumulation_steps=accumulation_steps,
+                        world_size=world_size,
+                        virtual_world_size=virtual_world_size,
+                        rng_states_by_rank=rng_states_by_rank,
+                    )
+                dist.barrier()
+
         if args.checkpoint_interval_steps > 0 and (step + 1) % args.checkpoint_interval_steps == 0:
+            rng_states_by_rank = collect_rng_states(device)
             if rank == 0:
                 print(f"\n{'='*80}")
                 print(
@@ -2060,7 +2306,12 @@ def main():
                     args=args,
                     best_val_loss=best_val_loss,
                     is_final=False,
-                    alpha_scheduler=alpha_scheduler
+                    alpha_scheduler=alpha_scheduler,
+                    train_batches_consumed_per_worker=train_batches_consumed_per_worker,
+                    accumulation_steps=accumulation_steps,
+                    world_size=world_size,
+                    virtual_world_size=virtual_world_size,
+                    rng_states_by_rank=rng_states_by_rank,
                 )
                 prune_step_checkpoints(args.checkpoint_dir, args.checkpoint_keep_latest_k)
 
@@ -2069,8 +2320,14 @@ def main():
         # Check if it's time to save a checkpoint (every N hours)
         current_time = time.time()
         time_since_last_checkpoint = current_time - last_checkpoint_time
+        checkpoint_due = torch.tensor(
+            int(rank == 0 and time_since_last_checkpoint >= checkpoint_interval_seconds),
+            device=device,
+        )
+        dist.broadcast(checkpoint_due, src=0)
 
-        if time_since_last_checkpoint >= checkpoint_interval_seconds:
+        if checkpoint_due.item():
+            rng_states_by_rank = collect_rng_states(device)
             if rank == 0:
                 print(f"\n{'='*80}")
                 print(f"Saving checkpoint (elapsed time: {time_since_last_checkpoint/3600:.2f} hours)")
@@ -2093,7 +2350,12 @@ def main():
                     args=args,
                     best_val_loss=best_val_loss,
                     is_final=False,
-                    alpha_scheduler=alpha_scheduler
+                    alpha_scheduler=alpha_scheduler,
+                    train_batches_consumed_per_worker=train_batches_consumed_per_worker,
+                    accumulation_steps=accumulation_steps,
+                    world_size=world_size,
+                    virtual_world_size=virtual_world_size,
+                    rng_states_by_rank=rng_states_by_rank,
                 )
 
                 print(f"\n{'='*80}")
@@ -2157,33 +2419,43 @@ def main():
                 print(f"Total tokens processed - Rank 0: {total_tokens_rank0:,}, World: {total_tokens_world:,}")
                 print(f"Total TFLOPs - Total: {total_flops/1e12:.2f}, Forward: {total_flops_forward/1e12:.2f}, Backward: {total_flops_backward/1e12:.2f}")
 
-    # Save final checkpoint (only on rank 0)
-    if rank == 0 and args.save_final_checkpoint:
-        print(f"\n{'='*80}")
-        print("Saving final checkpoint...")
-        print(f"{'='*80}\n")
+    # Align ranks before capturing final RNG state; rank 0 may have spent time
+    # in validation while the other ranks waited here.
+    dist.barrier()
 
-        save_checkpoint(
-            checkpoint_dir=args.checkpoint_dir,
-            model=model,
-            model_args=model_args,
-            shared_optimizer=shared_optimizer,
-            private_optimizers=private_optimizers,
-            private_param_store=private_param_store,
-            scheduler=scheduler,
-            step=step - 1,  # Use last completed step
-            total_tokens_rank0=total_tokens_rank0,
-            total_tokens_world=total_tokens_world,
-            total_flops=total_flops,
-            total_flops_forward=total_flops_forward,
-            total_flops_backward=total_flops_backward,
-            args=args,
-            best_val_loss=best_val_loss,
-            is_final=True,
-            alpha_scheduler=alpha_scheduler
-        )
+    if args.save_final_checkpoint:
+        rng_states_by_rank = collect_rng_states(device)
+        if rank == 0:
+            print(f"\n{'='*80}")
+            print("Saving final checkpoint...")
+            print(f"{'='*80}\n")
 
-        print("\nTraining complete! Final checkpoint saved.")
+            save_checkpoint(
+                checkpoint_dir=args.checkpoint_dir,
+                model=model,
+                model_args=model_args,
+                shared_optimizer=shared_optimizer,
+                private_optimizers=private_optimizers,
+                private_param_store=private_param_store,
+                scheduler=scheduler,
+                step=step - 1,  # Use last completed step
+                total_tokens_rank0=total_tokens_rank0,
+                total_tokens_world=total_tokens_world,
+                total_flops=total_flops,
+                total_flops_forward=total_flops_forward,
+                total_flops_backward=total_flops_backward,
+                args=args,
+                best_val_loss=best_val_loss,
+                is_final=True,
+                alpha_scheduler=alpha_scheduler,
+                train_batches_consumed_per_worker=train_batches_consumed_per_worker,
+                accumulation_steps=accumulation_steps,
+                world_size=world_size,
+                virtual_world_size=virtual_world_size,
+                rng_states_by_rank=rng_states_by_rank,
+            )
+
+            print("\nTraining complete! Final checkpoint saved.")
 
     # Synchronize all ranks before cleanup
     dist.barrier()

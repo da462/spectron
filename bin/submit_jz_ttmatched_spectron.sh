@@ -33,6 +33,17 @@ SUBMIT_LOW_RANK_RATIO="${LOW_RANK_RATIO:-0.25}"
 SUBMIT_LOW_RANK_W2_SAME_RANK="${LOW_RANK_W2_SAME_RANK_AS_W1W3:-0}"
 SUBMIT_LOW_RANK_ATTENTION_FACTORIZATION="${LOW_RANK_ATTENTION_FACTORIZATION:-whole}"
 SUBMIT_LOW_RANK_ATTENTION_PER_HEAD_RANK="${LOW_RANK_ATTENTION_PER_HEAD_RANK:-}"
+SUBMIT_MODEL_TAG="${MODEL_TAG:-tt134m}"
+SUBMIT_MODEL_SIZE_LABEL="${MODEL_SIZE_LABEL:-134m}"
+SUBMIT_HIDDEN_SIZE="${HIDDEN_SIZE:-768}"
+SUBMIT_NUM_LAYERS="${NUM_LAYERS:-12}"
+SUBMIT_NUM_HEADS="${NUM_HEADS:-12}"
+SUBMIT_N_KV_HEADS="${N_KV_HEADS:-$SUBMIT_NUM_HEADS}"
+SUBMIT_VOCAB_SIZE="${VOCAB_SIZE:-32000}"
+SUBMIT_SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-2048}"
+SUBMIT_MULTIPLE_OF="${MULTIPLE_OF:-256}"
+SUBMIT_ROPE_THETA="${ROPE_THETA:-10000}"
+SUBMIT_ADJUST_MUON_LR="${ADJUST_MUON_LR:-original}"
 SUBMIT_LR_TAG="${SUBMIT_MAX_LR//./p}"
 SUBMIT_LR_TAG="${SUBMIT_LR_TAG//e-/em}"
 SUBMIT_LR_TAG="${SUBMIT_LR_TAG//e+/ep}"
@@ -109,7 +120,7 @@ if [[ "$RUN_MODE" != "fullrank" && "$SUBMIT_LOW_RANK_ATTENTION_FACTORIZATION" ==
     JOB_SUFFIX="${JOB_SUFFIX}r${SUBMIT_LOW_RANK_ATTENTION_PER_HEAD_RANK}"
   fi
 fi
-JOB_NAME="spectron_tt134m_${SUBMIT_OPTIMIZER}_${RUN_MODE}_lr${SUBMIT_LR_TAG}_wd${SUBMIT_WD_TAG}_steps${JOB_STEPS}_sched${JOB_SCHEDULE_STEPS}${JOB_SUFFIX}"
+JOB_NAME="spectron_${SUBMIT_MODEL_TAG}_${SUBMIT_OPTIMIZER}_${RUN_MODE}_lr${SUBMIT_LR_TAG}_wd${SUBMIT_WD_TAG}_steps${JOB_STEPS}_sched${JOB_SCHEDULE_STEPS}${JOB_SUFFIX}"
 JOB_SCRIPT="$JOB_DIR/${JOB_NAME}_${PROFILE}_${RUN_STAMP}.slurm"
 
 case "$PROFILE" in
@@ -221,6 +232,7 @@ MAX_VAL_SAMPLES="\${MAX_VAL_SAMPLES:-100}"
 CHECKPOINT_INTERVAL_HOURS="\${CHECKPOINT_INTERVAL_HOURS:-2.8}"
 CHECKPOINT_INTERVAL_STEPS="\${CHECKPOINT_INTERVAL_STEPS:-500}"
 CHECKPOINT_KEEP_LATEST_K="\${CHECKPOINT_KEEP_LATEST_K:-2}"
+REQUIRE_RESUME="\${REQUIRE_RESUME:-0}"
 MAX_LR="\${MAX_LR:-$SUBMIT_MAX_LR}"
 OPTIMIZER="\${OPTIMIZER:-$SUBMIT_OPTIMIZER}"
 WEIGHT_DECAY="\${WEIGHT_DECAY:-$SUBMIT_WEIGHT_DECAY}"
@@ -243,6 +255,16 @@ LOW_RANK_RATIO="\${LOW_RANK_RATIO:-$SUBMIT_LOW_RANK_RATIO}"
 LOW_RANK_W2_SAME_RANK_AS_W1W3="\${LOW_RANK_W2_SAME_RANK_AS_W1W3:-$SUBMIT_LOW_RANK_W2_SAME_RANK}"
 LOW_RANK_ATTENTION_FACTORIZATION="\${LOW_RANK_ATTENTION_FACTORIZATION:-$SUBMIT_LOW_RANK_ATTENTION_FACTORIZATION}"
 LOW_RANK_ATTENTION_PER_HEAD_RANK="\${LOW_RANK_ATTENTION_PER_HEAD_RANK:-$SUBMIT_LOW_RANK_ATTENTION_PER_HEAD_RANK}"
+MODEL_SIZE_LABEL="\${MODEL_SIZE_LABEL:-$SUBMIT_MODEL_SIZE_LABEL}"
+HIDDEN_SIZE="\${HIDDEN_SIZE:-$SUBMIT_HIDDEN_SIZE}"
+NUM_LAYERS="\${NUM_LAYERS:-$SUBMIT_NUM_LAYERS}"
+NUM_HEADS="\${NUM_HEADS:-$SUBMIT_NUM_HEADS}"
+N_KV_HEADS="\${N_KV_HEADS:-$SUBMIT_N_KV_HEADS}"
+VOCAB_SIZE="\${VOCAB_SIZE:-$SUBMIT_VOCAB_SIZE}"
+SEQUENCE_LENGTH="\${SEQUENCE_LENGTH:-$SUBMIT_SEQUENCE_LENGTH}"
+MULTIPLE_OF="\${MULTIPLE_OF:-$SUBMIT_MULTIPLE_OF}"
+ROPE_THETA="\${ROPE_THETA:-$SUBMIT_ROPE_THETA}"
+ADJUST_MUON_LR="\${ADJUST_MUON_LR:-$SUBMIT_ADJUST_MUON_LR}"
 WARMUP_START_FACTOR="\${WARMUP_START_FACTOR:-0.0}"
 SKIP_FINAL_EVAL="\${SKIP_FINAL_EVAL:-1}"
 LR_TAG="\${MAX_LR//./p}"
@@ -321,7 +343,22 @@ if [[ "\$RUN_MODE" != "fullrank" && "\$LOW_RANK_ATTENTION_FACTORIZATION" == "per
     RUN_SUFFIX="\${RUN_SUFFIX}r\${LOW_RANK_ATTENTION_PER_HEAD_RANK}"
   fi
 fi
-RUN_NAME="\${RUN_NAME:-spectron_tt134m_fineweb_\${OPTIMIZER}_lr\${LR_TAG}_wd\${WD_TAG}_seq2048_steps\${TOTAL_STEPS}_sched\${LR_SCHEDULE_STEPS}_rope10000_\${RUN_MODE}\${RUN_SUFFIX}}"
+RUN_NAME="\${RUN_NAME:-spectron_${SUBMIT_MODEL_TAG}_fineweb_\${OPTIMIZER}_lr\${LR_TAG}_wd\${WD_TAG}_seq\${SEQUENCE_LENGTH}_steps\${TOTAL_STEPS}_sched\${LR_SCHEDULE_STEPS}_rope\${ROPE_THETA}_\${RUN_MODE}\${RUN_SUFFIX}}"
+CHECKPOINT_DIR="\$CHECKPOINT_ROOT/\$RUN_NAME"
+RESUME_FLAGS=()
+if [[ -z "\${RESUME_FROM:-}" && -d "\$CHECKPOINT_DIR" ]]; then
+  LATEST_CKPT="\$(find "\$CHECKPOINT_DIR" -type f \\( -name 'checkpoint_final.pt' -o -name 'checkpoint_step_*.pt' \\) -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)"
+  if [[ -n "\$LATEST_CKPT" ]]; then
+    RESUME_FROM="\$LATEST_CKPT"
+  fi
+fi
+if [[ -n "\${RESUME_FROM:-}" ]]; then
+  RESUME_FLAGS=(--resume_from "\$RESUME_FROM")
+fi
+if [[ "\$REQUIRE_RESUME" == "1" && \${#RESUME_FLAGS[@]} -eq 0 ]]; then
+  echo "REQUIRE_RESUME=1 but no completed checkpoint exists in \$CHECKPOINT_DIR" >&2
+  exit 1
+fi
 mkdir -p "\$WANDB_DIR"
 export WANDB_DIR
 
@@ -406,8 +443,8 @@ if [[ "\$TRACK_LOWRANK_LR_INTERVAL" != "0" ]]; then
 fi
 
 echo "Spectron TT-matched run"
-echo "  model_size=134m hidden=768 layers=12 heads=12"
-echo "  optimizer=\$OPTIMIZER run_mode=\$RUN_MODE rope_theta=10000 seq_len=2048 total_steps=\$TOTAL_STEPS lr_schedule_steps=\$LR_SCHEDULE_STEPS"
+echo "  model_size=\$MODEL_SIZE_LABEL hidden=\$HIDDEN_SIZE layers=\$NUM_LAYERS heads=\$NUM_HEADS kv_heads=\$N_KV_HEADS"
+echo "  optimizer=\$OPTIMIZER adjust_muon_lr=\$ADJUST_MUON_LR run_mode=\$RUN_MODE rope_theta=\$ROPE_THETA seq_len=\$SEQUENCE_LENGTH total_steps=\$TOTAL_STEPS lr_schedule_steps=\$LR_SCHEDULE_STEPS"
 echo "  lr=\$MAX_LR min_lr_factor=\$MIN_LR_FACTOR warmup_start_factor=\$WARMUP_START_FACTOR weight_decay=\$WEIGHT_DECAY nh_weight_decay=\$NH_WEIGHT_DECAY batch=\$GLOBAL_BATCH_SIZE micro_batch=\$MICRO_BATCH_SIZE"
 echo "  use_flex_attn=\$USE_FLEX_ATTN tt_style_init=\$TT_STYLE_INIT"
 echo "  spectral_lr_scaling=\$SPECTRAL_LR_SCALING spectral_lr_scaling_offset=\$SPECTRAL_LR_SCALING_OFFSET spectral_lr_target=\$SPECTRAL_LR_TARGET spectral_weight_decay=\$SPECTRAL_WEIGHT_DECAY swd_type=\$SWD_TYPE"
@@ -419,6 +456,9 @@ echo "  low_rank_attention_factorization=\$LOW_RANK_ATTENTION_FACTORIZATION low_
 echo "  log_interval=\$LOG_INTERVAL eval_interval=\$EVAL_INTERVAL skip_final_eval=\$SKIP_FINAL_EVAL"
 echo "  data_root=\$DATA_ROOT"
 echo "  run_name=\$RUN_NAME"
+echo "  checkpoint_dir=\$CHECKPOINT_DIR"
+echo "  resume_from=\${RESUME_FROM:-none}"
+echo "  require_resume=\$REQUIRE_RESUME"
 echo "  checkpoint_interval_steps=\$CHECKPOINT_INTERVAL_STEPS checkpoint_keep_latest_k=\$CHECKPOINT_KEEP_LATEST_K"
 echo "  wandb_mode=\$WANDB_MODE"
 echo "  wandb_dir=\$WANDB_DIR"
@@ -428,17 +468,18 @@ echo "  master_port=\$MASTER_PORT"
 
 exec torchrun --nproc_per_node="\$NPROC_PER_NODE" --master_port "\$MASTER_PORT" simple_gpt_training.py \\
   --seed 1234 \\
-  --hidden_size 768 \\
-  --num_layers 12 \\
-  --num_heads 12 \\
-  --n_kv_heads 12 \\
-  --vocab_size 32000 \\
-  --max_position_embeddings 2048 \\
-  --train_seq_len 2048 \\
-  --val_seq_len 2048 \\
-  --multiple_of 256 \\
-  --rope_theta 10000 \\
+  --hidden_size "\$HIDDEN_SIZE" \\
+  --num_layers "\$NUM_LAYERS" \\
+  --num_heads "\$NUM_HEADS" \\
+  --n_kv_heads "\$N_KV_HEADS" \\
+  --vocab_size "\$VOCAB_SIZE" \\
+  --max_position_embeddings "\$SEQUENCE_LENGTH" \\
+  --train_seq_len "\$SEQUENCE_LENGTH" \\
+  --val_seq_len "\$SEQUENCE_LENGTH" \\
+  --multiple_of "\$MULTIPLE_OF" \\
+  --rope_theta "\$ROPE_THETA" \\
   --optimizer "\$OPTIMIZER" \\
+  --adjust_muon_lr "\$ADJUST_MUON_LR" \\
   --max_lr "\$MAX_LR" \\
   --weight_decay "\$WEIGHT_DECAY" \\
   --nh_weight_decay "\$NH_WEIGHT_DECAY" \\
@@ -470,10 +511,11 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" --master_port "\$MASTER_PORT" 
   --checkpoint_keep_latest_k "\$CHECKPOINT_KEEP_LATEST_K" \\
   --train_files "\$DATA_ROOT/fineweb_train_*.bin" \\
   --val_files "\$DATA_ROOT/fineweb_val_*.bin" \\
-  --checkpoint_dir "\$CHECKPOINT_ROOT/\$RUN_NAME" \\
+  --checkpoint_dir "\$CHECKPOINT_DIR" \\
   --wandb_project "\$WANDB_PROJECT" \\
   --wandb_entity "\$WANDB_ENTITY" \\
   --run_name "\$RUN_NAME" \\
+  "\${RESUME_FLAGS[@]}" \\
   "\${FINAL_EVAL_FLAGS[@]}"
 EOF
 

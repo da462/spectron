@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 import json
 import os
 import glob
@@ -164,7 +164,48 @@ class BinaryDataset(Dataset):
         return {"input_ids": inputs, "labels": targets}
 
 
-def create_dataloaders(args, rank, world_size, device=None):
+class OffsetSequentialSampler(Sampler[int]):
+    """Iterate a sequential dataset from an exact sample offset."""
+
+    def __init__(self, data_source: Dataset, start_index: int = 0):
+        if start_index < 0 or start_index > len(data_source):
+            raise ValueError(
+                f"start_index must be between 0 and {len(data_source)}, got {start_index}"
+            )
+        self.data_source = data_source
+        self.start_index = start_index
+
+    def __iter__(self):
+        return iter(range(self.start_index, len(self.data_source)))
+
+    def __len__(self):
+        return len(self.data_source) - self.start_index
+
+
+def train_batch_offset(
+    batches_consumed: int,
+    dataset_size: int,
+    batch_size: int,
+) -> tuple[int, int]:
+    """Return the cyclic batch and sample offsets for a sequential loader."""
+    if batches_consumed < 0:
+        raise ValueError("batches_consumed must be non-negative")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    num_batches = (dataset_size + batch_size - 1) // batch_size
+    if num_batches == 0:
+        return 0, 0
+    batch_offset = batches_consumed % num_batches
+    return batch_offset, batch_offset * batch_size
+
+
+def create_dataloaders(
+    args,
+    rank,
+    world_size,
+    device=None,
+    train_batches_consumed: int = 0,
+):
     """
     Create training and validation dataloaders for GPT training.
     This version preloads the entire dataset to the GPU for faster training.
@@ -195,13 +236,25 @@ def create_dataloaders(args, rank, world_size, device=None):
         else args.batch_size
     )
 
+    batch_offset, sample_offset = train_batch_offset(
+        train_batches_consumed,
+        len(train_dataset),
+        effective_batch_size,
+    )
+    train_sampler = OffsetSequentialSampler(train_dataset, sample_offset)
+    train_generator = torch.Generator()
+    train_generator.manual_seed(int(getattr(args, "seed", 0)) + int(rank))
+
     # Data is on GPU, so no need for workers, pinning, or prefetching.
     train_loader = DataLoader(
         train_dataset,
         batch_size=effective_batch_size,
-        shuffle=False,  # Shuffling is often handled at the dataset level if needed
+        sampler=train_sampler,
         collate_fn=collate_fn,
+        generator=train_generator,
     )
+    train_loader.resume_batch_offset = batch_offset
+    train_loader.resume_sample_offset = sample_offset
 
     # Only rank 0 loads the validation set
     validation_loader = None
@@ -231,6 +284,9 @@ def create_dataloaders(args, rank, world_size, device=None):
             batch_size=val_loader_batch_size,
             shuffle=False,
             collate_fn=collate_fn,
+            generator=torch.Generator().manual_seed(
+                int(getattr(args, "seed", 0)) + 1_000_000
+            ),
         )
 
     return train_loader, validation_loader
