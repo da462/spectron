@@ -222,6 +222,7 @@ class _ActivationCapture:
         self.capture_functions = capture_functions
         self.matrices: dict[str, _MatrixCapture] = {}
         self.layers: dict[int, dict[str, torch.Tensor]] = {}
+        self.model_values: dict[str, torch.Tensor] = {}
         self.handles: list[Any] = []
 
     def _matrix_hook(self, name: str, module: nn.Module, inputs, output) -> None:
@@ -234,6 +235,14 @@ class _ActivationCapture:
     def _layer_output_hook(self, layer_index: int, key: str, module, inputs, output) -> None:
         if self.capture_functions:
             self.layers.setdefault(layer_index, {})[key] = output.detach()
+
+    def _model_pre_hook(self, key: str, module, inputs) -> None:
+        if self.capture_functions:
+            self.model_values[key] = inputs[0].detach()
+
+    def _model_output_hook(self, key: str, module, inputs, output) -> None:
+        if self.capture_functions:
+            self.model_values[key] = output.detach()
 
     def __enter__(self):
         for layer_name, layer in self.model.layers.items():
@@ -253,6 +262,13 @@ class _ActivationCapture:
                     layer.attention_norm.register_forward_pre_hook(
                         lambda module, inputs, index=layer_index: self._layer_pre_hook(
                             index, "attention_residual", module, inputs
+                        )
+                    )
+                )
+                self.handles.append(
+                    layer.attention_norm.register_forward_hook(
+                        lambda module, inputs, output, index=layer_index: self._layer_output_hook(
+                            index, "attention_normalized_input", module, inputs, output
                         )
                     )
                 )
@@ -284,6 +300,28 @@ class _ActivationCapture:
                         )
                     )
                 )
+        if self.capture_functions:
+            self.handles.append(
+                self.model.tok_embeddings.register_forward_hook(
+                    lambda module, inputs, output: self._model_output_hook(
+                        "embedding_output", module, inputs, output
+                    )
+                )
+            )
+            self.handles.append(
+                self.model.norm.register_forward_pre_hook(
+                    lambda module, inputs: self._model_pre_hook(
+                        "final_residual", module, inputs
+                    )
+                )
+            )
+            self.handles.append(
+                self.model.norm.register_forward_hook(
+                    lambda module, inputs, output: self._model_output_hook(
+                        "final_normalized", module, inputs, output
+                    )
+                )
+            )
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -433,6 +471,31 @@ class MechanisticDiagnostics:
             "spectron_denominator": None,
         }
 
+    def _parameter_audit(self, parameter: nn.Parameter) -> dict[str, Any]:
+        group = self._optimizer_group(parameter)
+        lr = float(group["lr"])
+        wd = float(group.get("weight_decay", 0.0))
+        return {
+            "actual_lr": lr,
+            "weight_decay": wd,
+            "decay_lr": lr,
+            "decay_multiplier": 1.0 - lr * wd,
+            "use_muon": bool(group.get("use_muon", False)),
+        }
+
+    def _parameter_snapshot(self, parameter: nn.Parameter) -> dict[str, Any]:
+        gradient = parameter.grad
+        return {
+            "parameter": parameter,
+            "weight": parameter.detach().float().clone(),
+            "gradient": (
+                torch.zeros_like(parameter, dtype=torch.float32)
+                if gradient is None
+                else gradient.detach().float().clone()
+            ),
+            "audit": self._parameter_audit(parameter),
+        }
+
     def before_optimizer_step(
         self,
         *,
@@ -518,6 +581,16 @@ class MechanisticDiagnostics:
                 values["gated_intermediate"] = capture.matrices[
                     f"{prefix}.w2"
                 ].inputs.detach().clone()
+            whole_model = {
+                key: value.detach().clone()
+                for key, value in capture.model_values.items()
+            }
+            whole_model["embedding"] = self._parameter_snapshot(
+                self.model.tok_embeddings.weight
+            )
+            whole_model["lm_head"] = self._parameter_snapshot(
+                self.model.output.weight
+            )
             self.pending = {
                 "update_number": update_number,
                 "base_lr": float(base_lr),
@@ -526,6 +599,7 @@ class MechanisticDiagnostics:
                 "layers": detached_layers,
                 "matrices": matrices,
                 "shadow": shadow,
+                "whole_model": whole_model,
             }
 
     def _write_function_metrics(self, pending: dict[str, Any]) -> None:
@@ -547,6 +621,27 @@ class MechanisticDiagnostics:
             )
             attention_residual = values["attention_residual"]
             attention_output = values["attention_output"]
+            attention_h = values["attention_normalized_input"]
+            with self._autocast():
+                attention_post = layer.attention(
+                    attention_h,
+                    self.model.freqs_cis.to(attention_h.device),
+                )
+            delta_attention = attention_post.float() - attention_output.float()
+            attention_post_state = attention_residual.float() + attention_post.float()
+            attention_pre_state = attention_residual.float() + attention_output.float()
+            attention_post_norm = torch.nn.functional.rms_norm(
+                attention_post_state,
+                (attention_post_state.shape[-1],),
+                eps=self.model.model_args.norm_eps,
+            )
+            attention_pre_norm = torch.nn.functional.rms_norm(
+                attention_pre_state,
+                (attention_pre_state.shape[-1],),
+                eps=self.model.model_args.norm_eps,
+            )
+            ffn_q = rms(delta_f) / rms(residual).clamp_min(EPS)
+            attention_q = rms(delta_attention) / rms(attention_residual).clamp_min(EPS)
             row = {
                 "step": pending["update_number"],
                 "layer": layer_index,
@@ -554,12 +649,22 @@ class MechanisticDiagnostics:
                 "branch_rms": float(rms(f_pre)),
                 "branch_to_residual": float(rms(f_pre) / rms(residual).clamp_min(EPS)),
                 "local_update_u": float(rms(delta_f) / rms(f_pre).clamp_min(EPS)),
-                "local_update_q": float(rms(delta_f) / rms(residual).clamp_min(EPS)),
+                "local_update_q": float(ffn_q),
                 "normalized_state_displacement_z": float(rms(post_norm - pre_norm)),
                 "attention_residual_rms": float(rms(attention_residual)),
                 "attention_branch_rms": float(rms(attention_output)),
                 "attention_branch_to_residual": float(
                     rms(attention_output) / rms(attention_residual).clamp_min(EPS)
+                ),
+                "attention_local_update_u": float(
+                    rms(delta_attention) / rms(attention_output).clamp_min(EPS)
+                ),
+                "attention_local_update_q": float(attention_q),
+                "attention_normalized_state_displacement_z": float(
+                    rms(attention_post_norm - attention_pre_norm)
+                ),
+                "ffn_to_attention_q_ratio": float(
+                    ffn_q / attention_q.clamp_min(EPS)
                 ),
                 "gate_preactivation": tensor_distribution(
                     values["gate_preactivation"]
@@ -573,6 +678,71 @@ class MechanisticDiagnostics:
                 "ffn_output": tensor_distribution(f_pre),
             }
             self._append("function_metrics.jsonl", row)
+
+    def _parameter_update_metrics(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        before = snapshot["weight"]
+        after = snapshot["parameter"].detach().float()
+        update = after - before
+        weight_rms = rms(before).clamp_min(EPS)
+        return {
+            "weight_rms_pre": float(weight_rms),
+            "weight_rms_post": float(rms(after)),
+            "gradient_rms": float(rms(snapshot["gradient"])),
+            "gradient_to_weight_rms": float(rms(snapshot["gradient"]) / weight_rms),
+            "update_rms": float(rms(update)),
+            "relative_update_rms": float(rms(update) / weight_rms),
+            "gradient_source": "training_batch_after_global_clip",
+            "optimizer": snapshot["audit"],
+        }
+
+    def _write_model_metrics(
+        self,
+        pending: dict[str, Any],
+        logits_post: torch.Tensor,
+        loss_post: torch.Tensor,
+        output_kl: torch.Tensor,
+    ) -> None:
+        whole_model = pending["whole_model"]
+        logits_pre = pending["logits_pre"].float()
+        log_probs_pre = torch.log_softmax(logits_pre, dim=-1)
+        probabilities_pre = log_probs_pre.exp()
+        entropy_pre = -(probabilities_pre * log_probs_pre).sum(dim=-1).mean()
+        logits_post_float = logits_post.float()
+        log_probs_post = torch.log_softmax(logits_post_float, dim=-1)
+        entropy_post = -(log_probs_post.exp() * log_probs_post).sum(dim=-1).mean()
+        embedding_output_pre = whole_model["embedding_output"].float()
+        embedding_output_post = self.model.tok_embeddings(self.tokens).float()
+        self._append(
+            "model_metrics.jsonl",
+            {
+                "step": pending["update_number"],
+                "embedding_output_rms_pre": float(rms(embedding_output_pre)),
+                "embedding_output_rms_post": float(rms(embedding_output_post)),
+                "embedding_output_update_rms": float(
+                    rms(embedding_output_post - embedding_output_pre)
+                ),
+                "embedding": self._parameter_update_metrics(
+                    whole_model["embedding"]
+                ),
+                "final_residual_rms": float(rms(whole_model["final_residual"])),
+                "final_normalized_rms": float(
+                    rms(whole_model["final_normalized"])
+                ),
+                "lm_head": self._parameter_update_metrics(whole_model["lm_head"]),
+                "logits_rms_pre": float(rms(logits_pre)),
+                "logits_rms_post": float(rms(logits_post_float)),
+                "logits_std_pre": float(logits_pre.std(unbiased=False)),
+                "logits_std_post": float(logits_post_float.std(unbiased=False)),
+                "logits_max_abs_pre": float(logits_pre.abs().max()),
+                "logits_max_abs_post": float(logits_post_float.abs().max()),
+                "prediction_entropy_pre": float(entropy_pre),
+                "prediction_entropy_post": float(entropy_post),
+                "diagnostic_ce_pre": pending["loss_pre"],
+                "diagnostic_ce_post": float(loss_post),
+                "logit_update_rms": float(rms(logits_post_float - logits_pre)),
+                "output_kl_pre_to_post": float(output_kl),
+            },
+        )
 
     def _write_matrix_metrics(self, pending: dict[str, Any]) -> None:
         for name, snapshot in pending["matrices"].items():
@@ -704,6 +874,7 @@ class MechanisticDiagnostics:
                 post_log_probs = torch.log_softmax(logits_post.float(), dim=-1)
                 pre_probs = pre_log_probs.exp()
                 kl = (pre_probs * (pre_log_probs - post_log_probs)).sum(dim=-1).mean()
+                self._write_model_metrics(pending, logits_post, loss_post, kl)
                 self._append(
                     "step_metrics.jsonl",
                     {

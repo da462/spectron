@@ -208,6 +208,7 @@ class TestMechanisticTrajectoryParity(unittest.TestCase):
             expected_counts = {
                 "function_metrics.jsonl": 2,
                 "matrix_metrics.jsonl": 6,
+                "model_metrics.jsonl": 1,
                 "step_metrics.jsonl": 1,
             }
             for filename, expected_count in expected_counts.items():
@@ -218,6 +219,40 @@ class TestMechanisticTrajectoryParity(unittest.TestCase):
                 self.assertEqual(len(rows), expected_count)
                 for row in rows:
                     _assert_finite_tree(self, row)
+
+            function_row = json.loads(
+                (metric_dir / "function_metrics.jsonl").read_text().splitlines()[0]
+            )
+            for key in (
+                "attention_residual_rms",
+                "attention_branch_rms",
+                "attention_branch_to_residual",
+                "attention_local_update_q",
+                "attention_normalized_state_displacement_z",
+                "ffn_to_attention_q_ratio",
+            ):
+                self.assertIn(key, function_row)
+
+            model_row = json.loads(
+                (metric_dir / "model_metrics.jsonl").read_text().splitlines()[0]
+            )
+            for key in (
+                "embedding_output_rms_pre",
+                "embedding",
+                "final_residual_rms",
+                "final_normalized_rms",
+                "lm_head",
+                "logits_rms_pre",
+                "logits_std_pre",
+                "logits_max_abs_pre",
+                "prediction_entropy_pre",
+                "diagnostic_ce_pre",
+                "logit_update_rms",
+                "output_kl_pre_to_post",
+            ):
+                self.assertIn(key, model_row)
+            self.assertIn("relative_update_rms", model_row["embedding"])
+            self.assertIn("relative_update_rms", model_row["lm_head"])
 
 
 if __name__ == "__main__":
