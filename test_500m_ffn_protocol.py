@@ -185,6 +185,10 @@ class Test500MFFNProtocol(unittest.TestCase):
             self.assertIn('HIDDEN_SIZE="${HIDDEN_SIZE:-1280}"', script)
             self.assertIn('NUM_LAYERS="${NUM_LAYERS:-20}"', script)
             self.assertIn('NUM_HEADS="${NUM_HEADS:-20}"', script)
+            self.assertIn(
+                'source "/lustre/fswork/projects/rech/qps/ulf36rc/spectron/.venv_spectron/bin/activate"',
+                script,
+            )
             self.assertIn('TOTAL_STEPS="${TOTAL_STEPS:-12368}"', script)
             self.assertIn('LR_SCHEDULE_STEPS="${LR_SCHEDULE_STEPS:-12368}"', script)
             self.assertIn('GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-512}"', script)

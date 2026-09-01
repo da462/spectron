@@ -25,6 +25,7 @@ SUBMIT_CHECKPOINT_KEEP_LATEST_K="${CHECKPOINT_KEEP_LATEST_K:-2}"
 SUBMIT_SPECTRAL_LR_SCALING="${SPECTRAL_LR_SCALING:-0}"
 SUBMIT_SPECTRAL_LR_SCALING_OFFSET="${SPECTRAL_LR_SCALING_OFFSET:-1.0}"
 SUBMIT_SPECTRAL_LR_TARGET="${SPECTRAL_LR_TARGET:-all}"
+SUBMIT_JZ_VENV="${JZ_VENV:-/lustre/fswork/projects/rech/qps/ulf36rc/spectron/.venv_spectron}"
 SUBMIT_LOWRANK_FFN_LR_MULTIPLIER="${LOWRANK_FFN_LR_MULTIPLIER:-1.0}"
 SUBMIT_LOWRANK_FFN_WEIGHT_DECAY="${LOWRANK_FFN_WEIGHT_DECAY:-}"
 SUBMIT_LOWRANK_ATTENTION_WEIGHT_DECAY="${LOWRANK_ATTENTION_WEIGHT_DECAY:-}"
@@ -219,6 +220,8 @@ source /etc/profile.d/proxy.sh || true
 
 if [[ -n "\${JZ_VENV:-}" ]]; then
   source "\$JZ_VENV/bin/activate"
+elif [[ -d "$SUBMIT_JZ_VENV" ]]; then
+  source "$SUBMIT_JZ_VENV/bin/activate"
 elif [[ -d "$REPO_DIR/.venv_spectron" ]]; then
   source "$REPO_DIR/.venv_spectron/bin/activate"
 else
