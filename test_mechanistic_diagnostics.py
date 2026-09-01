@@ -12,6 +12,7 @@ from mechanistic_diagnostics import (
     diagnostic_step,
     full_matrix_gradient,
     lowrank_subspaces,
+    normalize_device,
     product_update_decomposition,
     singular_metrics,
     tangent_motion_fractions,
@@ -33,6 +34,10 @@ def _assert_finite_tree(testcase: unittest.TestCase, value) -> None:
 
 
 class TestMechanisticNumerics(unittest.TestCase):
+    def test_integer_local_rank_normalizes_to_cuda_device(self) -> None:
+        self.assertEqual(normalize_device(0), torch.device("cuda", 0))
+        self.assertEqual(normalize_device("cpu"), torch.device("cpu"))
+
     def test_product_update_decomposition_is_exact(self) -> None:
         generator = torch.Generator().manual_seed(7)
         a = torch.randn(11, 4, generator=generator)

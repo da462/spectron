@@ -30,6 +30,12 @@ EPS = 1e-12
 FFN_MATRIX_NAMES = ("w1", "w2", "w3")
 
 
+def normalize_device(device: torch.device | str | int) -> torch.device:
+    if isinstance(device, int):
+        return torch.device("cuda", device)
+    return torch.device(device)
+
+
 def rms(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.float().square().mean().sqrt()
 
@@ -342,7 +348,7 @@ class MechanisticDiagnostics:
         output_dir: str,
         run_name: str,
         total_steps: int,
-        device: torch.device,
+        device: torch.device | str | int,
         bf16: bool,
         adjust_muon_lr: str,
         spectral_lr_scaling: bool,
@@ -350,9 +356,10 @@ class MechanisticDiagnostics:
         weight_decay: float,
         embedding_init_std: float,
     ) -> None:
+        normalized_device = normalize_device(device)
         payload = torch.load(diagnostic_batch_path, map_location="cpu", weights_only=True)
-        self.tokens = payload["input_ids"].to(device)
-        self.labels = payload["labels"].to(device)
+        self.tokens = payload["input_ids"].to(normalized_device)
+        self.labels = payload["labels"].to(normalized_device)
         self.batch_sha256 = payload.get("sha256", "unknown")
         self.model = model
         self.optimizer = optimizer
@@ -361,7 +368,7 @@ class MechanisticDiagnostics:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.run_name = run_name
         self.total_steps = total_steps
-        self.device = device
+        self.device = normalized_device
         self.bf16 = bf16
         self.adjust_muon_lr = adjust_muon_lr
         self.spectral_lr_scaling = spectral_lr_scaling
