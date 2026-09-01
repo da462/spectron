@@ -208,6 +208,42 @@ class Test500MFFNProtocol(unittest.TestCase):
         self.assertIn('SPECTRAL_LR_TARGET="${SPECTRAL_LR_TARGET:-ffn}"', spectron)
         self.assertIn("--spectral_lr_scaling", spectron)
 
+    def test_mechanistic_matrix_checkpoint_knobs_are_plumbed(self) -> None:
+        root = Path(__file__).resolve().parent
+        launcher = root / "bin" / "submit_jz_mechanistic_matrix.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "DRY_RUN": "1",
+                    "JOB_DIR": str(Path(tmp) / "jobs"),
+                    "LOG_DIR": str(Path(tmp) / "logs"),
+                    "MATRIX_CHECKPOINT_INTERVAL_STEPS": "500",
+                    "MATRIX_CHECKPOINT_KEEP_LATEST_K": "1",
+                }
+            )
+            subprocess.run(
+                ["bash", str(launcher), "a100_4_dev2h_cpu30_whj"],
+                cwd=root,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            jobs = sorted((Path(tmp) / "jobs").glob("*.slurm"))
+            scripts = [job.read_text() for job in jobs]
+
+        self.assertEqual(len(scripts), 8)
+        for script in scripts:
+            self.assertIn(
+                'CHECKPOINT_INTERVAL_STEPS="${CHECKPOINT_INTERVAL_STEPS:-500}"',
+                script,
+            )
+            self.assertIn(
+                'CHECKPOINT_KEEP_LATEST_K="${CHECKPOINT_KEEP_LATEST_K:-1}"',
+                script,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
