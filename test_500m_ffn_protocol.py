@@ -8,7 +8,7 @@ import torch
 
 from low_rank_linear import LowRankLinear, replace_linear_with_lowrank
 from model_analysis import calculate_transformer_training_flops
-from muon_local import _adjust_lr
+from muon_local import SingleDeviceMuon, _adjust_lr
 from optimizer_routing import (
     apply_lowrank_lr_overrides,
     lowrank_decoupled_weight_decay_lr,
@@ -145,6 +145,90 @@ class Test500MFFNProtocol(unittest.TestCase):
             _adjust_lr(0.01, "original", torch.Size([3_584, 320])),
             _adjust_lr(0.01, "match_rms_adamw", torch.Size([3_584, 320])),
         )
+
+    def test_single_device_muon_applies_adamrms_to_update_not_decay(self) -> None:
+        torch.manual_seed(0)
+        shape = (8, 4)
+        grad = torch.randn(shape)
+        plain = torch.nn.Parameter(torch.zeros(shape))
+        adamrms = torch.nn.Parameter(torch.zeros(shape))
+
+        plain.grad = grad.clone()
+        adamrms.grad = grad.clone()
+        SingleDeviceMuon(
+            [plain], lr=0.05, momentum=0.95, adjust_lr_fn="none"
+        ).step()
+        SingleDeviceMuon(
+            [adamrms], lr=0.05, momentum=0.95, adjust_lr_fn="match_rms_adamw"
+        ).step()
+
+        torch.testing.assert_close(
+            adamrms,
+            plain * (0.2 * max(shape) ** 0.5),
+            rtol=2e-3,
+            atol=2e-4,
+        )
+
+        decayed = torch.nn.Parameter(torch.ones(shape))
+        decayed.grad = torch.zeros_like(decayed)
+        SingleDeviceMuon(
+            [decayed],
+            lr=0.05,
+            weight_decay=0.1,
+            momentum=0.95,
+            adjust_lr_fn="match_rms_adamw",
+        ).step()
+        torch.testing.assert_close(
+            decayed,
+            torch.full_like(decayed, 1.0 - 0.05 * 0.1),
+        )
+
+    def test_launcher_carries_adamrms_and_weight_decay_overrides(self) -> None:
+        root = Path(__file__).resolve().parent
+        launcher = root / "bin" / "submit_jz_ttmatched_spectron.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "DRY_RUN": "1",
+                    "JOB_DIR": str(Path(tmp) / "jobs"),
+                    "LOG_DIR": str(Path(tmp) / "logs"),
+                    "MODEL_TAG": "adamrms_wd_test",
+                    "OPTIMIZER": "muon",
+                    "ADJUST_MUON_LR": "match_rms_adamw",
+                    "MAX_LR": "5e-2",
+                    "WEIGHT_DECAY": "0.1",
+                    "NH_WEIGHT_DECAY": "0.1",
+                    "EMBEDDING_INIT_STD": "0.02",
+                    "SPECTRAL_LR_SCALING": "0",
+                }
+            )
+            subprocess.run(
+                [
+                    "bash",
+                    str(launcher),
+                    "a100_4_dev2h_cpu30_whj",
+                    "lowrank_ffn",
+                ],
+                cwd=root,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            jobs = list((Path(tmp) / "jobs").glob("*.slurm"))
+            self.assertEqual(len(jobs), 1)
+            script = jobs[0].read_text()
+
+        self.assertIn('OPTIMIZER="${OPTIMIZER:-muon}"', script)
+        self.assertIn(
+            'ADJUST_MUON_LR="${ADJUST_MUON_LR:-match_rms_adamw}"', script
+        )
+        self.assertIn('MAX_LR="${MAX_LR:-5e-2}"', script)
+        self.assertIn('WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"', script)
+        self.assertIn('NH_WEIGHT_DECAY="${NH_WEIGHT_DECAY:-0.1}"', script)
+        self.assertIn('EMBEDDING_INIT_STD="${EMBEDDING_INIT_STD:-0.02}"', script)
+        self.assertIn('SPECTRAL_LR_SCALING="${SPECTRAL_LR_SCALING:-0}"', script)
 
     def test_launcher_prepares_matched_muon_and_spectron_jobs(self) -> None:
         root = Path(__file__).resolve().parent
