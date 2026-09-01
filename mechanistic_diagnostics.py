@@ -1,9 +1,10 @@
-"""Mechanistic diagnostics for dense and low-rank FFN optimizer updates.
+"""Sparse mechanistic diagnostics for dense and low-rank FFN updates.
 
-The diagnostics are deliberately side-effect free with respect to training:
-they use a fixed batch, restore RNG and train/eval state, request activation
-gradients with ``autograd.grad`` instead of populating parameter gradients, and
-only write detached statistics after the real optimizer step.
+The diagnostics are deliberately side-effect free with respect to training.
+At selected optimizer steps they use an immutable batch, restore RNG and
+train/eval state, request activation gradients with ``autograd.grad`` instead
+of populating parameter gradients, and write detached statistics after the
+real optimizer step. No diagnostic model pass runs on ordinary training steps.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import torch
 from torch import nn
 
 from low_rank_linear import LowRankLinear
-from muon_local import _adjust_lr, zeropower_via_newtonschulz5
+from muon_local import _adjust_lr
 from optimizer_routing import (
     lowrank_decoupled_weight_decay_lr,
     spectral_lr_target_matches,
@@ -42,7 +43,7 @@ def rms(tensor: torch.Tensor) -> torch.Tensor:
 
 def diagnostic_step(update_number: int, total_steps: int) -> bool:
     return (
-        update_number in {1, 10, 50, 100}
+        update_number in {1, 5, 10, 25, 50, 75, 100, 150, 200, 300}
         or update_number % 100 == 0
         or update_number == total_steps
     )
@@ -53,6 +54,14 @@ def full_matrix_gradient(inputs: torch.Tensor, output_grads: torch.Tensor) -> to
     x = inputs.detach().float().reshape(-1, inputs.shape[-1])
     d = output_grads.detach().float().reshape(-1, output_grads.shape[-1])
     return d.mT @ x
+
+
+def spectral_steepest_descent_oracle(
+    gradient: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``-UV^T`` and singular values for the instantaneous gradient."""
+    u, singular_values, vh = torch.linalg.svd(gradient.float(), full_matrices=False)
+    return -(u @ vh), singular_values
 
 
 def product_update_decomposition(
@@ -336,7 +345,7 @@ class _ActivationCapture:
 
 
 class MechanisticDiagnostics:
-    """Maintain fixed-batch shadow state and emit pre/post optimizer diagnostics."""
+    """Emit sparse fixed-batch pre/post optimizer diagnostics."""
 
     def __init__(
         self,
@@ -375,7 +384,6 @@ class MechanisticDiagnostics:
         self.spectral_lr_target = spectral_lr_target
         self.weight_decay = weight_decay
         self.embedding_init_std = embedding_init_std
-        self.shadow_momentum: dict[str, torch.Tensor] = {}
         self.pending: dict[str, Any] | None = None
         self._write_metadata()
 
@@ -391,6 +399,17 @@ class MechanisticDiagnostics:
             "spectral_lr_scaling": self.spectral_lr_scaling,
             "spectral_lr_target": self.spectral_lr_target,
             "weight_decay": self.weight_decay,
+            "diagnostic_steps": [
+                step
+                for step in range(1, self.total_steps + 1)
+                if diagnostic_step(step, self.total_steps)
+            ],
+            "full_matrix_reference": {
+                "kind": "instantaneous_spectral_steepest_descent_oracle",
+                "gradient": "diagnostic_batch_dL_dW",
+                "direction": "negative_exact_compact_svd_matrix_sign",
+                "momentum": False,
+            },
             "model": {
                 "dim": model_args.dim,
                 "layers": model_args.n_layers,
@@ -510,9 +529,12 @@ class MechanisticDiagnostics:
         base_lr: float,
         spectral_scaling: dict[str, float],
     ) -> None:
-        measure = diagnostic_step(update_number, self.total_steps)
+        if not diagnostic_step(update_number, self.total_steps):
+            self.pending = None
+            return
+
         with preserve_training_state(self.model, self.device):
-            with _ActivationCapture(self.model, capture_functions=measure) as capture:
+            with _ActivationCapture(self.model, capture_functions=True) as capture:
                 with self._autocast():
                     logits = self.model(self.tokens, input_batch=self.tokens)
                     loss = self.criterion(
@@ -522,30 +544,18 @@ class MechanisticDiagnostics:
                 outputs = [capture.matrices[name].output for name in names]
                 output_grads = torch.autograd.grad(loss, outputs, retain_graph=False)
 
-            shadow: dict[str, dict[str, torch.Tensor]] = {}
+            oracle: dict[str, dict[str, torch.Tensor]] = {}
             for name, output_grad in zip(names, output_grads):
                 matrix_capture = capture.matrices[name]
                 gradient = full_matrix_gradient(matrix_capture.inputs, output_grad)
-                momentum = self.shadow_momentum.get(name)
-                if momentum is None:
-                    momentum = torch.zeros_like(gradient)
-                    self.shadow_momentum[name] = momentum
-                momentum.lerp_(gradient, 0.05)
-                nesterov = torch.lerp(gradient, momentum, 0.95)
-                if measure:
-                    shadow[name] = {
-                        "gradient": gradient,
-                        "momentum": nesterov.clone(),
-                        "direction": -zeropower_via_newtonschulz5(
-                            nesterov, steps=5
-                        ).float(),
-                        "inputs": matrix_capture.inputs,
-                        "output_grads": output_grad.detach(),
-                    }
-
-            if not measure:
-                self.pending = None
-                return
+                direction, singular_values = spectral_steepest_descent_oracle(gradient)
+                oracle[name] = {
+                    "gradient": gradient,
+                    "direction": direction,
+                    "gradient_singular_values": singular_values,
+                    "inputs": matrix_capture.inputs,
+                    "output_grads": output_grad.detach(),
+                }
 
             matrices: dict[str, dict[str, Any]] = {}
             for name, matrix_capture in capture.matrices.items():
@@ -605,7 +615,7 @@ class MechanisticDiagnostics:
                 "logits_pre": logits.detach(),
                 "layers": detached_layers,
                 "matrices": matrices,
-                "shadow": shadow,
+                "oracle": oracle,
                 "whole_model": whole_model,
             }
 
@@ -754,7 +764,7 @@ class MechanisticDiagnostics:
     def _write_matrix_metrics(self, pending: dict[str, Any]) -> None:
         for name, snapshot in pending["matrices"].items():
             module = snapshot["module"]
-            shadow = pending["shadow"][name]
+            oracle = pending["oracle"][name]
             if snapshot["kind"] == "lowrank":
                 a_before = snapshot["a"]
                 b_before = snapshot["b"]
@@ -781,9 +791,9 @@ class MechanisticDiagnostics:
                 )
                 exact_s = torch.linalg.matrix_norm(delta, ord=2).clamp_min(EPS)
                 u, v, _ = lowrank_subspaces(a_before, b_before)
-                projected = tangent_projection(shadow["momentum"], u, v)
+                projected = tangent_projection(oracle["gradient"], u, v)
                 capture = torch.linalg.vector_norm(projected) / torch.linalg.vector_norm(
-                    shadow["momentum"]
+                    oracle["gradient"]
                 ).clamp_min(EPS)
                 row = {
                     "step": pending["update_number"],
@@ -806,7 +816,10 @@ class MechanisticDiagnostics:
                     "gradient_product_update_frobenius": float(
                         torch.linalg.vector_norm(gradient_delta)
                     ),
-                    "tangent_capture": float(capture),
+                    "instantaneous_gradient_tangent_capture": float(capture),
+                    "instantaneous_tangent_gradient_alignment": cosine_similarity(
+                        delta, -projected
+                    ),
                     **tangent_motion_fractions(delta, u, v),
                     **factor_condition_metrics(a_after, b_after),
                     "factor_a": snapshot["a_audit"],
@@ -834,30 +847,41 @@ class MechanisticDiagnostics:
                 }
 
             spectrum = singular_metrics(delta, attainable_rank)
-            shadow_direction = shadow["direction"]
-            shadow_momentum = shadow["momentum"]
-            shadow_singular = torch.linalg.svdvals(shadow_momentum.float())
+            oracle_direction = oracle["direction"]
+            instantaneous_gradient = oracle["gradient"]
+            gradient_singular = oracle["gradient_singular_values"]
             spectral_efficiency = -(
-                shadow_momentum * delta
+                instantaneous_gradient * delta
             ).sum() / (
-                shadow_singular.sum()
+                gradient_singular.sum()
                 * torch.linalg.matrix_norm(delta.float(), ord=2).clamp_min(EPS)
             ).clamp_min(EPS)
             row.update(
                 {
                     **spectrum,
-                    "shadow_direction_alignment": cosine_similarity(
-                        delta, shadow_direction
+                    "full_matrix_reference": (
+                        "instantaneous_spectral_steepest_descent_oracle"
                     ),
-                    "shadow_gradient_descent_alignment": cosine_similarity(
-                        delta, -shadow["gradient"]
+                    "instantaneous_spectral_oracle_alignment": cosine_similarity(
+                        delta, oracle_direction
                     ),
-                    "spectral_descent_efficiency": float(spectral_efficiency),
-                    "shadow_direction_spectrum": singular_metrics(
-                        shadow_direction, min(shadow_direction.shape)
+                    "instantaneous_gradient_descent_alignment": cosine_similarity(
+                        delta, -instantaneous_gradient
+                    ),
+                    "instantaneous_spectral_descent_efficiency": float(
+                        spectral_efficiency
+                    ),
+                    "instantaneous_gradient_nuclear_norm": float(
+                        gradient_singular.sum()
+                    ),
+                    "instantaneous_gradient_spectral_norm": float(
+                        gradient_singular[0]
+                    ),
+                    "instantaneous_gradient_singular_values_top32": (
+                        gradient_singular[:32].cpu().tolist()
                     ),
                     **per_token_linearized_loss_change(
-                        shadow["inputs"], shadow["output_grads"], delta
+                        oracle["inputs"], oracle["output_grads"], delta
                     ),
                 }
             )

@@ -15,6 +15,7 @@ from mechanistic_diagnostics import (
     normalize_device,
     product_update_decomposition,
     singular_metrics,
+    spectral_steepest_descent_oracle,
     tangent_motion_fractions,
     tangent_projection,
 )
@@ -60,7 +61,7 @@ class TestMechanisticNumerics(unittest.TestCase):
         )
         self.assertAlmostEqual(first["stable_rank"], second["stable_rank"], places=5)
 
-    def test_shadow_full_matrix_gradient_matches_autograd(self) -> None:
+    def test_instantaneous_full_matrix_gradient_matches_autograd(self) -> None:
         generator = torch.Generator().manual_seed(9)
         x = torch.randn(2, 5, 7, generator=generator)
         weight = torch.randn(6, 7, generator=generator, requires_grad=True)
@@ -70,6 +71,18 @@ class TestMechanisticNumerics(unittest.TestCase):
         expected = torch.autograd.grad(loss, weight)[0]
         actual = full_matrix_gradient(x, coefficients)
         torch.testing.assert_close(actual, expected)
+
+    def test_spectral_oracle_is_the_exact_steepest_descent_direction(self) -> None:
+        gradient = torch.randn(7, 5, generator=torch.Generator().manual_seed(17))
+        direction, singular_values = spectral_steepest_descent_oracle(gradient)
+
+        self.assertAlmostEqual(
+            float(torch.linalg.matrix_norm(direction, ord=2)), 1.0, places=5
+        )
+        efficiency = -torch.sum(gradient * direction) / (
+            singular_values.sum() * torch.linalg.matrix_norm(direction, ord=2)
+        )
+        self.assertAlmostEqual(float(efficiency), 1.0, places=5)
 
     def test_tangent_projection_and_motion_decomposition(self) -> None:
         generator = torch.Generator().manual_seed(10)
@@ -84,8 +97,11 @@ class TestMechanisticNumerics(unittest.TestCase):
         self.assertAlmostEqual(sum(fractions.values()), 1.0, places=5)
 
     def test_requested_diagnostic_schedule(self) -> None:
-        selected = [step for step in range(1, 251) if diagnostic_step(step, 250)]
-        self.assertEqual(selected, [1, 10, 50, 100, 200, 250])
+        selected = [step for step in range(1, 351) if diagnostic_step(step, 350)]
+        self.assertEqual(
+            selected,
+            [1, 5, 10, 25, 50, 75, 100, 150, 200, 300, 350],
+        )
 
 
 class TestMechanisticTrajectoryParity(unittest.TestCase):
@@ -152,7 +168,7 @@ class TestMechanisticTrajectoryParity(unittest.TestCase):
         instrumented.load_state_dict(baseline.state_dict())
         baseline_optimizer = self._optimizer(baseline)
         instrumented_optimizer = self._optimizer(instrumented)
-        tokens = torch.randint(0, 64, (1, 8), generator=torch.Generator().manual_seed(12))
+        tokens = torch.randint(0, 64, (4, 8), generator=torch.Generator().manual_seed(12))
         labels = torch.roll(tokens.to(torch.long), shifts=-1, dims=1)
         criterion = torch.nn.CrossEntropyLoss()
 
@@ -209,6 +225,17 @@ class TestMechanisticTrajectoryParity(unittest.TestCase):
                     baseline_parameter, instrumented_parameter, rtol=0, atol=0
                 )
 
+            forward_calls = []
+            handle = instrumented.register_forward_hook(
+                lambda module, inputs, output: forward_calls.append(1)
+            )
+            diagnostics.before_optimizer_step(
+                update_number=2, base_lr=0.01, spectral_scaling={}
+            )
+            handle.remove()
+            self.assertEqual(forward_calls, [])
+            self.assertIsNone(diagnostics.pending)
+
             metric_dir = Path(directory) / "metrics"
             expected_counts = {
                 "function_metrics.jsonl": 2,
@@ -224,6 +251,14 @@ class TestMechanisticTrajectoryParity(unittest.TestCase):
                 self.assertEqual(len(rows), expected_count)
                 for row in rows:
                     _assert_finite_tree(self, row)
+
+            metadata = json.loads((metric_dir / "metadata.json").read_text())
+            self.assertEqual(metadata["diagnostic_batch_shape"], [4, 8])
+            self.assertFalse(metadata["full_matrix_reference"]["momentum"])
+            self.assertEqual(
+                metadata["full_matrix_reference"]["direction"],
+                "negative_exact_compact_svd_matrix_sign",
+            )
 
             function_row = json.loads(
                 (metric_dir / "function_metrics.jsonl").read_text().splitlines()[0]
@@ -258,6 +293,22 @@ class TestMechanisticTrajectoryParity(unittest.TestCase):
                 self.assertIn(key, model_row)
             self.assertIn("relative_update_rms", model_row["embedding"])
             self.assertIn("relative_update_rms", model_row["lm_head"])
+
+            matrix_row = json.loads(
+                (metric_dir / "matrix_metrics.jsonl").read_text().splitlines()[0]
+            )
+            for key in (
+                "instantaneous_spectral_oracle_alignment",
+                "instantaneous_gradient_descent_alignment",
+                "instantaneous_spectral_descent_efficiency",
+                "instantaneous_gradient_nuclear_norm",
+                "instantaneous_gradient_spectral_norm",
+                "instantaneous_gradient_singular_values_top32",
+                "instantaneous_gradient_tangent_capture",
+                "instantaneous_tangent_gradient_alignment",
+            ):
+                self.assertIn(key, matrix_row)
+            self.assertFalse(any("shadow" in key for key in matrix_row))
 
 
 if __name__ == "__main__":

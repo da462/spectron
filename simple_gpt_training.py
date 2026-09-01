@@ -28,7 +28,7 @@ from optimizer_routing import (
     lowrank_module_type,
     lowrank_weight_decay_for_param,
 )
-from mechanistic_diagnostics import MechanisticDiagnostics
+from mechanistic_diagnostics import MechanisticDiagnostics, diagnostic_step
 # Base seed for reproducibility. Keep the historical default unless a run
 # explicitly overrides it.
 BASE_SEED = 1337
@@ -2036,7 +2036,11 @@ def main():
                                     base_lr * frob_regularization_grads[param_name]
                                 )
 
-        if args.mechanistic_diagnostics:
+        run_mechanistic_diagnostics = (
+            args.mechanistic_diagnostics
+            and diagnostic_step(step + 1, args.total_steps)
+        )
+        if run_mechanistic_diagnostics:
             if rank == 0:
                 mechanistic_diagnostics.before_optimizer_step(
                     update_number=step + 1,
@@ -2096,7 +2100,7 @@ def main():
         # Step shared optimizer once per global step
         shared_optimizer.step()
 
-        if args.mechanistic_diagnostics:
+        if run_mechanistic_diagnostics:
             if rank == 0:
                 mechanistic_diagnostics.after_optimizer_step()
             dist.barrier()

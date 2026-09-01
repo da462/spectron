@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE="${1:-h100_4_dev2h_cpu30_whj}"
-DIAGNOSTIC_BATCH="${MECHANISTIC_DIAGNOSTIC_BATCH:-/lustre/fswork/projects/rech/qps/ulf36rc/spectron_data/mechanistic/fineweb_first_seq2048.pt}"
+DIAGNOSTIC_BATCH="${MECHANISTIC_DIAGNOSTIC_BATCH:-/lustre/fswork/projects/rech/qps/ulf36rc/spectron_data/mechanistic/fineweb_first4_seq2048.pt}"
 MATRIX_CHECKPOINT_INTERVAL_STEPS="${MATRIX_CHECKPOINT_INTERVAL_STEPS:-0}"
 MATRIX_CHECKPOINT_KEEP_LATEST_K="${MATRIX_CHECKPOINT_KEEP_LATEST_K:-2}"
 export JZ_VENV="${JZ_VENV:-/lustre/fswork/projects/rech/qps/ulf36rc/spectron/.venv_spectron}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create the immutable first-sequence batch used by mechanistic runs."""
+"""Create an immutable fixed batch used by mechanistic runs."""
 
 from __future__ import annotations
 

@@ -324,6 +324,10 @@ class Test500MFFNProtocol(unittest.TestCase):
         self.assertEqual(len(scripts), 8)
         for script in scripts:
             self.assertIn(
+                "fineweb_first4_seq2048.pt",
+                script,
+            )
+            self.assertIn(
                 'CHECKPOINT_INTERVAL_STEPS="${CHECKPOINT_INTERVAL_STEPS:-500}"',
                 script,
             )
