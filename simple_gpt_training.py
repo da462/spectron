@@ -28,6 +28,7 @@ from optimizer_routing import (
     lowrank_module_type,
     lowrank_weight_decay_for_param,
 )
+from mechanistic_diagnostics import MechanisticDiagnostics
 # Base seed for reproducibility. Keep the historical default unless a run
 # explicitly overrides it.
 BASE_SEED = 1337
@@ -60,6 +61,7 @@ RESUME_CRITICAL_ARGS = (
     "max_position_embeddings",
     "rope_theta",
     "tt_style_init",
+    "embedding_init_std",
     "low_rank",
     "low_rank_ratio",
     "disable_c",
@@ -72,6 +74,8 @@ RESUME_CRITICAL_ARGS = (
     "spectral_lr_scaling_offset",
     "lowrank_ffn_weight_decay",
     "lowrank_attention_weight_decay",
+    "mechanistic_diagnostics",
+    "mechanistic_diagnostic_batch",
     "stochastic_depth",
     "stochastic_depth_mode",
     "num_overlaps",
@@ -879,6 +883,12 @@ def main():
         action='store_true',
         help='Initialize weights with TorchTitan Llama3-style rules for ablations',
     )
+    parser.add_argument(
+        '--embedding_init_std',
+        type=float,
+        default=None,
+        help='Override only the token-embedding initialization standard deviation',
+    )
 
     # Subnet config
     parser.add_argument('--stochastic_depth', action='store_true')
@@ -922,6 +932,23 @@ def main():
     parser.add_argument('--track_lowrank_lr_module_type', type=str, default='ffn',
                         choices=LOWRANK_LR_TRACK_MODULE_CHOICES,
                         help='Which low-rank factors to include in LR diagnostics')
+    parser.add_argument(
+        '--mechanistic_diagnostics',
+        action='store_true',
+        help='Enable fixed-batch pre/post optimizer diagnostics on rank 0',
+    )
+    parser.add_argument(
+        '--mechanistic_diagnostic_batch',
+        type=str,
+        default=None,
+        help='Immutable .pt batch shared by all mechanistic runs',
+    )
+    parser.add_argument(
+        '--mechanistic_output_dir',
+        type=str,
+        default=None,
+        help='Directory for mechanistic JSONL diagnostics',
+    )
     parser.add_argument('--spectral_weight_decay', type=float, default=0.0,
                         help='Spectral norm weight decay coefficient (default: 0.0, disabled)')
     parser.add_argument('--swd_type', type=str, default='standard', choices=['standard', 'product'],
@@ -1033,6 +1060,18 @@ def main():
         raise ValueError("--warmup_start_factor must be between 0 and 1")
     if args.checkpoint_interval_steps < 0:
         raise ValueError("--checkpoint_interval_steps must be non-negative")
+    if args.embedding_init_std is not None and args.embedding_init_std <= 0:
+        raise ValueError("--embedding_init_std must be positive")
+    if args.mechanistic_diagnostics:
+        if not args.mechanistic_diagnostic_batch:
+            raise ValueError(
+                "--mechanistic_diagnostics requires --mechanistic_diagnostic_batch"
+            )
+        if args.spectral_weight_decay > 0 or args.frobenius_coef > 0:
+            raise ValueError(
+                "Mechanistic update decomposition requires spectral and "
+                "Frobenius regularization to be disabled"
+            )
 
     # Validate Muon optimizer availability
     if args.optimizer == 'muon' and not MUON_AVAILABLE:
@@ -1096,10 +1135,16 @@ def main():
         ffn_dim_multiplier=args.ffn_dim_multiplier,
         rope_theta=args.rope_theta,
         depth_init=args.tt_style_init,
+        embedding_init_std=args.embedding_init_std,
     )
     model = TitanGPT(model_args).to(device)
     if rank == 0 and args.tt_style_init:
         print("Using TorchTitan Llama3-style initialization")
+    if rank == 0 and args.embedding_init_std is not None:
+        print(
+            "Overriding token-embedding initialization std: "
+            f"{args.embedding_init_std}"
+        )
 
     # Apply low-rank decomposition if enabled
     if args.low_rank:
@@ -1772,6 +1817,31 @@ def main():
                 lowrank_lr_path.write_text("", encoding="utf-8")
             print(f"Low-rank LR JSONL: {lowrank_lr_path}")
 
+    mechanistic_diagnostics = None
+    if args.mechanistic_diagnostics and rank == 0:
+        mechanistic_output_dir = args.mechanistic_output_dir or os.path.join(
+            args.checkpoint_dir, "mechanistic_diagnostics"
+        )
+        mechanistic_diagnostics = MechanisticDiagnostics(
+            model=model,
+            optimizer=shared_optimizer,
+            criterion=criterion,
+            diagnostic_batch_path=args.mechanistic_diagnostic_batch,
+            output_dir=mechanistic_output_dir,
+            run_name=args.run_name,
+            total_steps=args.total_steps,
+            device=device,
+            bf16=args.bf16,
+            adjust_muon_lr=args.adjust_muon_lr,
+            spectral_lr_scaling=args.spectral_lr_scaling,
+            spectral_lr_target=args.spectral_lr_target,
+            weight_decay=args.weight_decay,
+            embedding_init_std=(
+                1.0 if args.embedding_init_std is None else args.embedding_init_std
+            ),
+        )
+        print(f"Mechanistic diagnostics: {mechanistic_output_dir}")
+
     while step < args.total_steps:
         # Reset shared grads only at the beginning of the global step
         for p in shared_params_list:
@@ -1966,6 +2036,15 @@ def main():
                                     base_lr * frob_regularization_grads[param_name]
                                 )
 
+        if args.mechanistic_diagnostics:
+            if rank == 0:
+                mechanistic_diagnostics.before_optimizer_step(
+                    update_number=step + 1,
+                    base_lr=float(base_lr),
+                    spectral_scaling=spectral_scaling,
+                )
+            dist.barrier()
+
         # Do decoupled WD manually for low-rank params when Spectron scaling
         # disables optimizer WD on those groups. Targeted Spectron factors use
         # the base LR; non-target low-rank Muon groups use their plain LR.
@@ -2016,6 +2095,11 @@ def main():
 
         # Step shared optimizer once per global step
         shared_optimizer.step()
+
+        if args.mechanistic_diagnostics:
+            if rank == 0:
+                mechanistic_diagnostics.after_optimizer_step()
+            dist.barrier()
 
         scheduler.step()
         train_batches_consumed_per_worker += accumulation_steps

@@ -80,6 +80,7 @@ validation/
 # Output directories
 output/
 outputs/
+jobs/
 results/
 logs/
 runs/

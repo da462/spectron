@@ -29,6 +29,7 @@ class TitanModelArgs:
     use_flex_attn: bool = False
     attn_mask_type: str = "causal"
     depth_init: bool = False
+    embedding_init_std: float | None = None
 
 
 # --- Rotary Embedding Helpers from torchtitan ---
@@ -165,6 +166,9 @@ class TitanGPT(nn.Module):
         self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=False)
         if model_args.depth_init:
             self._apply_torchtitan_llama3_init()
+        if model_args.embedding_init_std is not None:
+            with torch.no_grad():
+                self.tok_embeddings.weight.mul_(model_args.embedding_init_std)
 
     @staticmethod
     def _depth_scaled_std(base_std: float, layer_id: int) -> float:
