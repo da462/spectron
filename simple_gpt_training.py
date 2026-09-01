@@ -29,6 +29,7 @@ from optimizer_routing import (
     lowrank_weight_decay_for_param,
 )
 from mechanistic_diagnostics import MechanisticDiagnostics, diagnostic_step
+from lightweight_diagnostics import LightweightDiagnostics
 # Base seed for reproducibility. Keep the historical default unless a run
 # explicitly overrides it.
 BASE_SEED = 1337
@@ -949,6 +950,23 @@ def main():
         default=None,
         help='Directory for mechanistic JSONL diagnostics',
     )
+    parser.add_argument(
+        '--lightweight_diagnostics',
+        action='store_true',
+        help='Record scalar-only diagnostics from each real training step',
+    )
+    parser.add_argument(
+        '--lightweight_output_dir',
+        type=str,
+        default=None,
+        help='Directory for high-frequency lightweight diagnostic JSONL files',
+    )
+    parser.add_argument(
+        '--lightweight_product_interval',
+        type=int,
+        default=0,
+        help='Record exact Gram-based low-rank product metrics every N steps; 0 disables',
+    )
     parser.add_argument('--spectral_weight_decay', type=float, default=0.0,
                         help='Spectral norm weight decay coefficient (default: 0.0, disabled)')
     parser.add_argument('--swd_type', type=str, default='standard', choices=['standard', 'product'],
@@ -1071,6 +1089,20 @@ def main():
             raise ValueError(
                 "Mechanistic update decomposition requires spectral and "
                 "Frobenius regularization to be disabled"
+            )
+    if args.lightweight_product_interval < 0:
+        raise ValueError("--lightweight_product_interval must be non-negative")
+    if args.lightweight_product_interval > 0 and not args.lightweight_diagnostics:
+        raise ValueError(
+            "--lightweight_product_interval requires --lightweight_diagnostics"
+        )
+    if args.lightweight_diagnostics:
+        if args.optimizer != "muon":
+            raise ValueError("Lightweight optimizer diagnostics currently require Muon")
+        if args.spectral_weight_decay > 0 or args.frobenius_coef > 0:
+            raise ValueError(
+                "Lightweight update accounting requires spectral and Frobenius "
+                "regularization to be disabled"
             )
 
     # Validate Muon optimizer availability
@@ -1842,7 +1874,31 @@ def main():
         )
         print(f"Mechanistic diagnostics: {mechanistic_output_dir}")
 
+    lightweight_diagnostics = None
+    if args.lightweight_diagnostics:
+        lightweight_output_dir = args.lightweight_output_dir or os.path.join(
+            args.checkpoint_dir, "lightweight_diagnostics"
+        )
+        lightweight_diagnostics = LightweightDiagnostics(
+            model=model,
+            optimizer=shared_optimizer,
+            output_dir=lightweight_output_dir,
+            run_name=args.run_name,
+            rank=rank,
+            world_size=world_size,
+            product_interval=args.lightweight_product_interval,
+            adjust_muon_lr=args.adjust_muon_lr,
+        )
+        if rank == 0:
+            print(
+                "Lightweight diagnostics: "
+                f"{lightweight_output_dir} "
+                f"(product interval {args.lightweight_product_interval})"
+            )
+
     while step < args.total_steps:
+        if lightweight_diagnostics is not None:
+            lightweight_diagnostics.begin_training_step(step + 1)
         # Reset shared grads only at the beginning of the global step
         for p in shared_params_list:
             if p.grad is not None:
@@ -1935,6 +1991,9 @@ def main():
                 for pn in private_names:
                     if param_dict[pn].grad is not None:
                         param_dict[pn].grad.zero_()
+
+        if lightweight_diagnostics is not None:
+            lightweight_diagnostics.end_training_forward()
 
         # Communication step for shared params across GPUs
         if args.stochastic_depth and param_sharing is not None:
@@ -2049,6 +2108,35 @@ def main():
                 )
             dist.barrier()
 
+        # Compute the manual Spectron decay map before applying it so the
+        # lightweight observer can reconstruct the pre-decay factors.
+        manual_lowrank_decay = {}
+        if args.spectral_lr_scaling:
+            for pg in shared_optimizer.param_groups:
+                if not pg.get('is_lowrank', False) or 'param_name' not in pg:
+                    continue
+                lowrank_weight_decay = pg.get(
+                    'lowrank_weight_decay', args.weight_decay
+                )
+                if lowrank_weight_decay <= 0:
+                    continue
+                decay_lr = lowrank_decoupled_weight_decay_lr(
+                    pg,
+                    base_lr=base_lr,
+                    spectral_lr_target=args.spectral_lr_target,
+                )
+                for param in pg['params']:
+                    manual_lowrank_decay[id(param)] = (
+                        float(lowrank_weight_decay),
+                        float(decay_lr),
+                    )
+
+        if lightweight_diagnostics is not None:
+            lightweight_diagnostics.prepare_optimizer_step(
+                base_lr=float(base_lr),
+                manual_decay=manual_lowrank_decay,
+            )
+
         # Do decoupled WD manually for low-rank params when Spectron scaling
         # disables optimizer WD on those groups. Targeted Spectron factors use
         # the base LR; non-target low-rank Muon groups use their plain LR.
@@ -2099,6 +2187,14 @@ def main():
 
         # Step shared optimizer once per global step
         shared_optimizer.step()
+
+        if lightweight_diagnostics is not None:
+            lightweight_diagnostics.finish_step(
+                loss=float(accumulated_loss),
+                grad_norm=float(grad_norm),
+                tokens_seen=int(total_tokens_world),
+                tokens_this_step=int(args.batch_size * args.train_seq_len),
+            )
 
         if run_mechanistic_diagnostics:
             if rank == 0:
@@ -2457,6 +2553,9 @@ def main():
             if rank == 0:
                 print(f"Rank {rank}: Destroying process group and exiting at step {step}")
 
+            if lightweight_diagnostics is not None:
+                lightweight_diagnostics.close()
+
             # Destroy process group and exit immediately (no final evaluation or checkpoint)
             dist.destroy_process_group()
             return
@@ -2544,6 +2643,16 @@ def main():
             )
 
             print("\nTraining complete! Final checkpoint saved.")
+
+    if rank == 0 and torch.cuda.is_available():
+        print(
+            "CUDA peak memory: "
+            f"allocated={torch.cuda.max_memory_allocated()} "
+            f"reserved={torch.cuda.max_memory_reserved()}"
+        )
+
+    if lightweight_diagnostics is not None:
+        lightweight_diagnostics.close()
 
     # Synchronize all ranks before cleanup
     dist.barrier()

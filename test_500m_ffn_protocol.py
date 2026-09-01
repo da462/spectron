@@ -308,6 +308,7 @@ class Test500MFFNProtocol(unittest.TestCase):
                     "LOG_DIR": str(Path(tmp) / "logs"),
                     "MATRIX_CHECKPOINT_INTERVAL_STEPS": "500",
                     "MATRIX_CHECKPOINT_KEEP_LATEST_K": "1",
+                    "MATRIX_LIGHTWEIGHT_PRODUCT_INTERVAL": "5",
                 }
             )
             subprocess.run(
@@ -333,6 +334,14 @@ class Test500MFFNProtocol(unittest.TestCase):
             )
             self.assertIn(
                 'CHECKPOINT_KEEP_LATEST_K="${CHECKPOINT_KEEP_LATEST_K:-1}"',
+                script,
+            )
+            self.assertIn(
+                'LIGHTWEIGHT_DIAGNOSTICS="${LIGHTWEIGHT_DIAGNOSTICS:-1}"',
+                script,
+            )
+            self.assertIn(
+                'LIGHTWEIGHT_PRODUCT_INTERVAL="${LIGHTWEIGHT_PRODUCT_INTERVAL:-5}"',
                 script,
             )
 
