@@ -173,7 +173,7 @@ def plot(
         )
 
     axis.set_xlim(0, 2234)
-    axis.set_ylim(top=3.4)
+    axis.set_ylim(2.9, 3.4)
     axis.set_xlabel("Optimizer step")
     axis.set_ylabel("Training cross-entropy")
     axis.grid(True, alpha=0.20)
