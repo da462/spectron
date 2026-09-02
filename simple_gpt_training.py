@@ -865,7 +865,12 @@ def main():
         '--lowrank_optimizer',
         type=str,
         default='factor_muon',
-        choices=['factor_muon', 'lora_muon'],
+        choices=[
+            'factor_muon',
+            'lora_muon',
+            'product_adamrms',
+            'headclip',
+        ],
         help='Optimizer geometry for native low-rank A/B pairs',
     )
     parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'wsd'],
@@ -1077,26 +1082,28 @@ def main():
             )
     if args.low_rank_attention_per_head_rank is not None and args.low_rank_attention_per_head_rank <= 0:
         raise ValueError("--low_rank_attention_per_head_rank must be positive")
-    if args.lowrank_optimizer == 'lora_muon':
+    if args.lowrank_optimizer != 'factor_muon':
         if args.optimizer != 'muon':
-            raise ValueError("--lowrank_optimizer=lora_muon requires --optimizer=muon")
+            raise ValueError("Paired low-rank optimizers require --optimizer=muon")
         if not args.low_rank or not args.disable_c:
             raise ValueError(
-                "--lowrank_optimizer=lora_muon requires AB low-rank layers "
+                "Paired low-rank optimizers require AB low-rank layers "
                 "(--low_rank --disable_c)"
             )
         if 'attention' not in args.exclude_modules:
             raise ValueError(
-                "The initial LoRA-Muon probe supports FFN-only factorization; "
+                "Paired low-rank optimizer probes support FFN-only factorization; "
                 "exclude attention"
             )
         if args.spectral_lr_scaling:
-            raise ValueError("LoRA-Muon cannot be combined with Spectron LR scaling")
+            raise ValueError(
+                "Paired low-rank optimizers cannot be combined with Spectron LR scaling"
+            )
         if args.lowrank_ffn_lr_multiplier != 1.0:
-            raise ValueError("LoRA-Muon uses its scheduled product LR directly")
+            raise ValueError("Paired low-rank optimizers use the scheduled base LR")
         if lowrank_weight_decay_overridden:
             raise ValueError(
-                "LoRA-Muon applies the base weight decay with its split product rule"
+                "Paired low-rank optimizer probes use the base weight decay"
             )
     if args.low_rank_attention_factorization == "per_head":
         if not args.low_rank:
@@ -1487,8 +1494,8 @@ def main():
         ]
         return param_groups
 
-    def build_lora_muon_optim_groups(param_list, param_names):
-        """Keep dense Muon/Adam routing and replace only FFN A/B pair updates."""
+    def build_paired_lowrank_optim_groups(param_list, param_names, variant):
+        """Keep dense Muon/Adam routing and pair only FFN A/B updates."""
         hidden_weights = []
         hidden_gains_biases = []
         nonhidden_params = []
@@ -1498,7 +1505,7 @@ def main():
             if name.endswith('.A') or name.endswith('.B'):
                 if '.feed_forward.' not in name:
                     raise ValueError(
-                        f"LoRA-Muon probe received a non-FFN factor: {name}"
+                        f"Paired optimizer probe received a non-FFN factor: {name}"
                     )
                 pair_name, factor_name = name.rsplit('.', 1)
                 factor_pairs.setdefault(pair_name, {})[factor_name] = (name, param)
@@ -1542,37 +1549,45 @@ def main():
             factors = factor_pairs[pair_name]
             if set(factors) != {'A', 'B'}:
                 raise ValueError(
-                    f"LoRA-Muon requires one A and B for {pair_name}, got "
+                    f"Paired optimizer requires one A and B for {pair_name}, got "
                     f"{sorted(factors)}"
                 )
             name_a, factor_a = factors['A']
             name_b, factor_b = factors['B']
-            param_groups.append(
-                dict(
-                    params=[factor_a, factor_b],
-                    use_muon=False,
-                    use_lora_muon=True,
-                    lr=args.max_lr,
-                    momentum=0.95,
-                    weight_decay=args.weight_decay,
-                    is_lowrank=True,
-                    pair_name=pair_name,
-                    pair_param_names=(name_a, name_b),
-                    lora_pair_index=pair_index,
-                    lowrank_module_type='ffn',
-                )
+            pair_group = dict(
+                params=[factor_a, factor_b],
+                use_muon=False,
+                use_lora_muon=variant == 'lora_muon',
+                lr=args.max_lr,
+                momentum=0.95,
+                weight_decay=args.weight_decay,
+                is_lowrank=True,
+                pair_name=pair_name,
+                pair_param_names=(name_a, name_b),
+                lowrank_module_type='ffn',
             )
+            if variant == 'lora_muon':
+                pair_group['lora_pair_index'] = pair_index
+            else:
+                pair_group['factor_update_variant'] = variant
+                pair_group['factor_pair_index'] = pair_index
+                pair_group['proposal_adjust_lr_fn'] = (
+                    'none' if variant == 'product_adamrms' else 'match_rms_adamw'
+                )
+            param_groups.append(pair_group)
         if not factor_pairs:
-            raise ValueError("LoRA-Muon found no low-rank A/B pairs")
+            raise ValueError("Paired optimizer found no low-rank A/B pairs")
         return param_groups
 
     def create_optimizer(param_list, param_names=None, use_lowrank_individual_groups=False):
         """Create optimizer based on args.optimizer"""
-        if args.lowrank_optimizer == 'lora_muon':
+        if args.lowrank_optimizer != 'factor_muon':
             if param_names is None:
-                raise ValueError("param_names required for LoRA-Muon")
+                raise ValueError("param_names required for paired low-rank optimizers")
             return MuonWithAuxAdam(
-                build_lora_muon_optim_groups(param_list, param_names)
+                build_paired_lowrank_optim_groups(
+                    param_list, param_names, args.lowrank_optimizer
+                )
             )
         if use_lowrank_individual_groups and param_names is not None:
             # Use Muon with individual low-rank groups for spectral LR scaling
@@ -1615,6 +1630,12 @@ def main():
             if args.lowrank_optimizer == 'lora_muon':
                 print("  FFN factor LR: direct LoRA-Muon product radius")
                 print("  FFN factor WD: split product decay")
+            elif args.lowrank_optimizer == 'product_adamrms':
+                print("  FFN factor LR: shared product-space AdamRMS target 0.2")
+                print("  FFN factor WD: standard independent factor decay")
+            elif args.lowrank_optimizer == 'headclip':
+                print("  FFN proposal: independent factor AdamRMS")
+                print("  FFN correction: tangent HeadClip with tau=sigma2")
         else:
             print(f"  Learning rate: {args.max_lr}")
             print(f"  Adam betas: ({args.adam_beta1}, {args.adam_beta2})")

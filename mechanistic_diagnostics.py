@@ -465,6 +465,9 @@ class MechanisticDiagnostics:
         )
         scale = spectral_scaling.get(name)
         lr_multiplier = float(group.get("lr_multiplier", 1.0))
+        proposal_adjustment = str(
+            group.get("proposal_adjust_lr_fn", self.adjust_muon_lr)
+        )
         return {
             "actual_lr": actual_lr,
             "nominal_factor_lr": float(base_lr) * lr_multiplier,
@@ -473,7 +476,11 @@ class MechanisticDiagnostics:
             "decay_lr": float(decay_lr),
             "decay_multiplier": 1.0 - float(decay_lr) * lowrank_wd,
             "muon_shape_multiplier": _adjust_lr(
-                1.0, self.adjust_muon_lr, parameter.shape
+                1.0, proposal_adjustment, parameter.shape
+            ),
+            "proposal_adjust_lr_fn": proposal_adjustment,
+            "factor_update_variant": group.get(
+                "factor_update_variant", "factor_muon"
             ),
             "spectron_targeted": is_spectron,
             "spectron_scale": None if scale is None else float(scale),

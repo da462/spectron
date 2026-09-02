@@ -38,6 +38,58 @@ _UPDATE_FIELDS = (
     "total_update_sumsq",
 )
 
+_PAIR_METRIC_FIELDS = (
+    "present",
+    "pre_first_order_direction_rms",
+    "product_adamrms_multiplier",
+    "first_order_direction_rms",
+    "first_order_update_rms",
+    "actual_update_rms",
+    "quadratic_to_first_frobenius",
+    "actual_update_frobenius",
+    "pre_sigma1",
+    "pre_sigma2",
+    "pre_sigma1_to_sigma2",
+    "target_tau",
+    "head_beta",
+    "head_fraction_removed",
+    "post_sigma1",
+    "post_sigma2",
+    "post_sigma1_to_sigma2",
+    "pre_update_frobenius",
+    "post_update_frobenius",
+    "relative_frobenius_change",
+)
+
+_PAIR_FIELDS_BY_VARIANT = {
+    "product_adamrms": (
+        "pre_first_order_direction_rms",
+        "product_adamrms_multiplier",
+        "first_order_direction_rms",
+        "first_order_update_rms",
+        "actual_update_rms",
+        "quadratic_to_first_frobenius",
+        "actual_update_frobenius",
+        "post_sigma1",
+        "post_sigma2",
+        "post_sigma1_to_sigma2",
+    ),
+    "headclip": (
+        "pre_sigma1",
+        "pre_sigma2",
+        "pre_sigma1_to_sigma2",
+        "target_tau",
+        "head_beta",
+        "head_fraction_removed",
+        "post_sigma1",
+        "post_sigma2",
+        "post_sigma1_to_sigma2",
+        "pre_update_frobenius",
+        "post_update_frobenius",
+        "relative_frobenius_change",
+    ),
+}
+
 
 def _shape_adjustment_multiplier(mode: str, shape: torch.Size) -> float:
     if mode == "none":
@@ -358,6 +410,19 @@ class LightweightDiagnostics:
             name: index for index, name in enumerate(self._observed_names)
         }
         self._pairs = self._select_lowrank_ffn_pairs()
+        self._pair_by_name = {pair["base_name"]: pair for pair in self._pairs}
+        self._pair_variants = {
+            str(group["pair_name"]): str(group["factor_update_variant"])
+            for group in optimizer.param_groups
+            if group.get("factor_update_variant") is not None
+        }
+        self._pair_metric_layout = {
+            name: index * len(_PAIR_METRIC_FIELDS)
+            for index, name in enumerate(sorted(self._pair_variants))
+        }
+        self._pair_metric_values = len(self._pair_metric_layout) * len(
+            _PAIR_METRIC_FIELDS
+        )
         self._gram_layout, self._gram_values = self._build_gram_layout()
         self._scalar_values = len(self._observed_names) * len(_UPDATE_FIELDS)
 
@@ -373,6 +438,7 @@ class LightweightDiagnostics:
         if rank == 0:
             self._write_metadata(run_name)
         optimizer.update_observer = self.observe_update
+        optimizer.pair_update_observer = self.observe_pair_update
 
     def _select_observed_names(self) -> list[str]:
         names = []
@@ -455,6 +521,7 @@ class LightweightDiagnostics:
                 "none": "none",
             }.get(self.adjust_muon_lr, self.adjust_muon_lr),
             "heavy_diagnostics_unchanged": True,
+            "paired_factor_variants": self._pair_variants,
         }
         (self.output_dir / "metadata.json").write_text(
             json.dumps(metadata, indent=2, sort_keys=True) + "\n"
@@ -479,9 +546,9 @@ class LightweightDiagnostics:
             self.product_interval > 0
             and self._update_number % self.product_interval == 0
         )
-        length = self._scalar_values + (
-            self._gram_values if self._product_due else 0
-        )
+        length = self._scalar_values
+        if self._product_due:
+            length += self._gram_values + self._pair_metric_values
         device = next(self.model.parameters()).device
         self._buffer = torch.zeros(length, device=device, dtype=torch.float32)
         self._manual_decay = {
@@ -489,6 +556,7 @@ class LightweightDiagnostics:
             for param_id, (coefficient, decay_lr) in manual_decay.items()
         }
         self._active = True
+        self.optimizer.pair_metrics_due = self._product_due
 
     @torch.no_grad()
     def _copy_factor_grams(
@@ -603,6 +671,36 @@ class LightweightDiagnostics:
             factor="A" if name.endswith(".A") else "B",
         )
 
+    @torch.no_grad()
+    def observe_pair_update(
+        self,
+        pair_name: str,
+        metrics: dict[str, float],
+        group: dict,
+        optimizer_kind: str,
+    ) -> None:
+        if (
+            not self._active
+            or not self._product_due
+            or self._buffer is None
+            or pair_name not in self._pair_metric_layout
+        ):
+            return
+        start = (
+            self._scalar_values
+            + self._gram_values
+            + self._pair_metric_layout[pair_name]
+        )
+        target = self._buffer[start : start + len(_PAIR_METRIC_FIELDS)]
+        values = {"present": 1.0, **metrics}
+        target.copy_(
+            torch.tensor(
+                [float(values.get(field, 0.0)) for field in _PAIR_METRIC_FIELDS],
+                device=target.device,
+                dtype=target.dtype,
+            )
+        )
+
     def _scalar_record(self, name: str) -> dict[str, float]:
         source = self._read_buffer if self._read_buffer is not None else self._buffer
         if source is None:
@@ -622,6 +720,18 @@ class LightweightDiagnostics:
             self._scalar_values + offset : self._scalar_values + offset + size
         ].view(3, rank, rank)
         return values[0], values[1], values[2]
+
+    def _pair_metric_record(self, pair_name: str) -> dict[str, float]:
+        source = self._read_buffer if self._read_buffer is not None else self._buffer
+        if source is None:
+            raise RuntimeError("No diagnostic buffer is available")
+        start = (
+            self._scalar_values
+            + self._gram_values
+            + self._pair_metric_layout[pair_name]
+        )
+        values = source[start : start + len(_PAIR_METRIC_FIELDS)].tolist()
+        return dict(zip(_PAIR_METRIC_FIELDS, values))
 
     def _parameter_rows(self) -> list[dict[str, Any]]:
         rows = []
@@ -751,6 +861,43 @@ class LightweightDiagnostics:
             )
         return rows
 
+    def _pair_optimizer_rows(self) -> list[dict[str, Any]]:
+        if not self._product_due:
+            return []
+        rows = []
+        for pair_name, variant in sorted(self._pair_variants.items()):
+            record = self._pair_metric_record(pair_name)
+            if record["present"] < 0.5:
+                continue
+            pair = self._pair_by_name[pair_name]
+            row = {
+                "step": self._update_number,
+                "param_name": pair_name,
+                "layer": pair["layer"],
+                "matrix": pair["matrix"],
+                "rank": pair["rank"],
+                "factor_update_variant": variant,
+            }
+            row.update(
+                {
+                    field: record[field]
+                    for field in _PAIR_FIELDS_BY_VARIANT[variant]
+                }
+            )
+            if variant == "product_adamrms":
+                pair_group = next(
+                    group
+                    for group in self.optimizer.param_groups
+                    if group.get("pair_name") == pair_name
+                )
+                target = 0.2 * float(pair_group["lr"])
+                row["target_first_order_update_rms"] = target
+                row["first_order_target_relative_error"] = abs(
+                    row["first_order_update_rms"] - target
+                ) / max(target, 1e-30)
+            rows.append(row)
+        return rows
+
     @staticmethod
     def _activation_rows(
         update_number: int, stats: dict[str, dict[str, float]]
@@ -823,6 +970,7 @@ class LightweightDiagnostics:
             layer_rows = self._activation_rows(self._update_number, activation_stats)
             parameter_rows = self._parameter_rows()
             product_rows = self._product_rows()
+            pair_optimizer_rows = self._pair_optimizer_rows()
             elapsed = time.perf_counter() - self._step_started_at
 
             attention_ratios = [row["attention_branch_to_residual"] for row in layer_rows]
@@ -873,17 +1021,27 @@ class LightweightDiagnostics:
             self._append_rows("step_metrics.jsonl", [step_row])
             self._append_rows("layer_metrics.jsonl", layer_rows)
             self._append_rows("matrix_metrics.jsonl", parameter_rows + product_rows)
+            self._append_rows(
+                "pair_optimizer_metrics.jsonl", pair_optimizer_rows
+            )
 
         self._manual_decay.clear()
         self._read_buffer = None
         self._buffer = None
         self._product_due = False
+        self.optimizer.pair_metrics_due = False
 
     def close(self) -> None:
         self._active = False
         self.activation.close()
         if getattr(self.optimizer, "update_observer", None) == self.observe_update:
             self.optimizer.update_observer = None
+        if (
+            getattr(self.optimizer, "pair_update_observer", None)
+            == self.observe_pair_update
+        ):
+            self.optimizer.pair_update_observer = None
+        self.optimizer.pair_metrics_due = False
         for handle in self._files.values():
             handle.close()
         self._files.clear()

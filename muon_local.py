@@ -2,6 +2,13 @@ import torch
 import torch.distributed as dist
 import math
 
+from factor_product_updates import (
+    approximate_update_top2,
+    headclip_directions,
+    metrics_to_float,
+    product_adamrms_directions,
+    product_update_metrics,
+)
 from lora_muon import apply_lora_muon_step, lora_muon_factor_directions
 
 
@@ -9,6 +16,12 @@ def _notify_update(optimizer, parameter, update, group, optimizer_kind):
     observer = getattr(optimizer, "update_observer", None)
     if observer is not None:
         observer(parameter, update, group, optimizer_kind)
+
+
+def _notify_pair_update(optimizer, pair_name, metrics, group, optimizer_kind):
+    observer = getattr(optimizer, "pair_update_observer", None)
+    if observer is not None:
+        observer(pair_name, metrics, group, optimizer_kind)
 
 
 def _adjust_lr(lr: float, adjust_lr_fn: str, param_shape: torch.Size) -> float:
@@ -86,6 +99,95 @@ def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True, adjust_lr_
     # else: 'none' - no scaling applied
 
     return update
+
+
+@torch.no_grad()
+def _step_paired_factor_muon(optimizer, group):
+    factor_a, factor_b = group["params"]
+    for parameter in (factor_a, factor_b):
+        if parameter.grad is None:
+            parameter.grad = torch.zeros_like(parameter)
+        state = optimizer.state[parameter]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros_like(parameter)
+
+    variant = group["factor_update_variant"]
+    proposal_adjustment = (
+        "none" if variant == "product_adamrms" else "match_rms_adamw"
+    )
+    direction_a = muon_update(
+        factor_a.grad,
+        optimizer.state[factor_a]["momentum_buffer"],
+        beta=group["momentum"],
+        adjust_lr_fn=proposal_adjustment,
+    )
+    direction_b = muon_update(
+        factor_b.grad,
+        optimizer.state[factor_b]["momentum_buffer"],
+        beta=group["momentum"],
+        adjust_lr_fn=proposal_adjustment,
+    )
+    metrics_due = bool(getattr(optimizer, "pair_metrics_due", False))
+    pair_index = int(group.get("factor_pair_index", 0))
+    pair_state = optimizer.state[factor_a]
+
+    if variant == "product_adamrms":
+        direction_a, direction_b, metrics = product_adamrms_directions(
+            factor_a, factor_b, direction_a, direction_b
+        )
+        if metrics_due:
+            delta_a = -group["lr"] * direction_a
+            delta_b = -group["lr"] * direction_b
+            metrics.update(
+                product_update_metrics(
+                    factor_a, factor_b, delta_a, delta_b
+                )
+            )
+            singular, _, _, basis = approximate_update_top2(
+                factor_a,
+                factor_b,
+                delta_a,
+                delta_b,
+                left_basis=pair_state.get("product_metric_left_basis"),
+                power_iterations=4,
+                seed=pair_index,
+            )
+            pair_state["product_metric_left_basis"] = basis.to(factor_a.dtype)
+            metrics["post_sigma1"] = singular[0]
+            metrics["post_sigma2"] = singular[1]
+            metrics["post_sigma1_to_sigma2"] = singular[0] / singular[1].clamp_min(
+                1e-12
+            )
+    elif variant == "headclip":
+        direction_a, direction_b, basis, metrics = headclip_directions(
+            factor_a,
+            factor_b,
+            direction_a,
+            direction_b,
+            learning_rate=group["lr"],
+            left_basis=pair_state.get("headclip_left_basis"),
+            power_iterations=group.get("headclip_power_iterations", 4),
+            seed=pair_index,
+            collect_post_metrics=metrics_due,
+        )
+        pair_state["headclip_left_basis"] = basis.to(factor_a.dtype)
+    else:
+        raise ValueError(f"Unknown factor update variant: {variant}")
+
+    _notify_update(optimizer, factor_a, direction_a, group, "muon")
+    _notify_update(optimizer, factor_b, direction_b, group, "muon")
+    if metrics_due:
+        _notify_pair_update(
+            optimizer,
+            group["pair_name"],
+            metrics_to_float(metrics),
+            group,
+            variant,
+        )
+
+    decay = 1.0 - group["lr"] * group["weight_decay"]
+    factor_a.mul_(decay).add_(direction_a, alpha=-group["lr"])
+    factor_b.mul_(decay).add_(direction_b, alpha=-group["lr"])
 
 
 class Muon(torch.optim.Optimizer):
@@ -216,7 +318,24 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
     def __init__(self, param_groups):
         for group in param_groups:
             assert "use_muon" in group
-            if group.get("use_lora_muon", False):
+            if group.get("factor_update_variant") is not None:
+                if group["use_muon"]:
+                    raise ValueError("Paired factor groups cannot use generic Muon")
+                if len(group["params"]) != 2:
+                    raise ValueError("Paired factor groups require exactly one A/B pair")
+                if group["factor_update_variant"] not in {
+                    "product_adamrms",
+                    "headclip",
+                }:
+                    raise ValueError(
+                        f"Unknown factor update variant: {group['factor_update_variant']}"
+                    )
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                group["factor_pair_index"] = group.get("factor_pair_index", 0)
+                group["adjust_lr_fn"] = "none"
+            elif group.get("use_lora_muon", False):
                 if group["use_muon"]:
                     raise ValueError("LoRA-Muon pair groups cannot also use factor Muon")
                 if len(group["params"]) != 2:
@@ -242,6 +361,8 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
                 #assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
         super().__init__(param_groups, dict())
         self.update_observer = None
+        self.pair_update_observer = None
+        self.pair_metrics_due = False
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -252,7 +373,18 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            if group.get("use_lora_muon", False):
+            if group.get("factor_update_variant") is not None:
+                distributed = dist.is_available() and dist.is_initialized()
+                world_size = dist.get_world_size() if distributed else 1
+                rank = dist.get_rank() if distributed else 0
+                owner = int(group["factor_pair_index"]) % world_size
+                factor_a, factor_b = group["params"]
+                if rank == owner:
+                    _step_paired_factor_muon(self, group)
+                if distributed:
+                    dist.broadcast(factor_a, src=owner)
+                    dist.broadcast(factor_b, src=owner)
+            elif group.get("use_lora_muon", False):
                 factor_a, factor_b = group["params"]
                 for parameter in (factor_a, factor_b):
                     if parameter.grad is None:
@@ -336,7 +468,23 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
     def __init__(self, param_groups):
         for group in param_groups:
             assert "use_muon" in group
-            if group.get("use_lora_muon", False):
+            if group.get("factor_update_variant") is not None:
+                if group["use_muon"]:
+                    raise ValueError("Paired factor groups cannot use generic Muon")
+                if len(group["params"]) != 2:
+                    raise ValueError("Paired factor groups require exactly one A/B pair")
+                if group["factor_update_variant"] not in {
+                    "product_adamrms",
+                    "headclip",
+                }:
+                    raise ValueError(
+                        f"Unknown factor update variant: {group['factor_update_variant']}"
+                    )
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                group["adjust_lr_fn"] = "none"
+            elif group.get("use_lora_muon", False):
                 if group["use_muon"]:
                     raise ValueError("LoRA-Muon pair groups cannot also use factor Muon")
                 if len(group["params"]) != 2:
@@ -360,6 +508,8 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                 group["weight_decay"] = group.get("weight_decay", 0)
         super().__init__(param_groups, dict())
         self.update_observer = None
+        self.pair_update_observer = None
+        self.pair_metrics_due = False
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -370,7 +520,9 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            if group.get("use_lora_muon", False):
+            if group.get("factor_update_variant") is not None:
+                _step_paired_factor_muon(self, group)
+            elif group.get("use_lora_muon", False):
                 factor_a, factor_b = group["params"]
                 for parameter in (factor_a, factor_b):
                     if parameter.grad is None:
