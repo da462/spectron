@@ -416,6 +416,9 @@ class LightweightDiagnostics:
         world_size: int,
         product_interval: int,
         adjust_muon_lr: str,
+        scheduler: str = "unknown",
+        aux_adamw_lr_multiplier: float = 1.0,
+        stable_decay_fraction: float = 0.3,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
@@ -423,6 +426,9 @@ class LightweightDiagnostics:
         self.world_size = world_size
         self.product_interval = product_interval
         self.adjust_muon_lr = adjust_muon_lr
+        self.scheduler = scheduler
+        self.aux_adamw_lr_multiplier = aux_adamw_lr_multiplier
+        self.stable_decay_fraction = stable_decay_fraction
         self.output_dir = Path(output_dir)
         if rank == 0:
             self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -540,6 +546,9 @@ class LightweightDiagnostics:
             "product_interval": self.product_interval,
             "product_representation": "A_at_B_repo_orientation",
             "muon_adjustment": self.adjust_muon_lr,
+            "aux_adamw_lr_multiplier": self.aux_adamw_lr_multiplier,
+            "scheduler": self.scheduler,
+            "stable_decay_fraction": self.stable_decay_fraction,
             "muon_adjustment_label": {
                 "original": "keller_original",
                 "match_rms_adamw": "moonshot_match_rms_adamw",

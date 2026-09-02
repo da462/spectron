@@ -30,6 +30,7 @@ from optimizer_routing import (
 )
 from mechanistic_diagnostics import MechanisticDiagnostics, diagnostic_step
 from lightweight_diagnostics import LightweightDiagnostics
+from training_protocols import auxiliary_adamw_lr, stable_linear_decay_factor
 # Base seed for reproducibility. Keep the historical default unless a run
 # explicitly overrides it.
 BASE_SEED = 1337
@@ -52,6 +53,8 @@ RESUME_CRITICAL_ARGS = (
     "adam_beta1",
     "adam_beta2",
     "adjust_muon_lr",
+    "aux_adamw_lr_multiplier",
+    "stable_decay_fraction",
     "bf16",
     "vocab_size",
     "num_layers",
@@ -862,6 +865,12 @@ def main():
     parser.add_argument('--adjust_muon_lr', type=str, default='original', choices=['original', 'match_rms_adamw', 'none'],
                         help='Muon learning rate adjustment function: original (sqrt(max(1, A/B))), match_rms_adamw (0.2*sqrt(max(A,B))), or none (no adjustment)')
     parser.add_argument(
+        '--aux_adamw_lr_multiplier',
+        type=float,
+        default=1.0,
+        help='Auxiliary AdamW LR as a multiplier of the scheduled Muon base LR',
+    )
+    parser.add_argument(
         '--lowrank_optimizer',
         type=str,
         default='factor_muon',
@@ -874,8 +883,22 @@ def main():
         ],
         help='Optimizer geometry for native low-rank A/B pairs',
     )
-    parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'wsd'],
-                        help='Learning rate scheduler to use: cosine or wsd (warmup-stable-decay)')
+    parser.add_argument(
+        '--scheduler',
+        type=str,
+        default='cosine',
+        choices=['cosine', 'wsd', 'stable_linear_decay'],
+        help=(
+            'Learning rate scheduler: cosine, wsd, or stable_linear_decay '
+            '(peak LR immediately, then a final linear cooldown)'
+        ),
+    )
+    parser.add_argument(
+        '--stable_decay_fraction',
+        type=float,
+        default=0.3,
+        help='Fraction of scheduled updates used by stable_linear_decay cooldown',
+    )
     parser.add_argument('--min_lr_factor', type=float, default=0.1,
                         help='Final LR as a fraction of max_lr for cosine AdamW schedule')
 
@@ -1047,6 +1070,17 @@ def main():
         raise ValueError("--eval_interval must be non-negative")
     if args.min_lr_factor < 0:
         raise ValueError("--min_lr_factor must be non-negative")
+    if args.aux_adamw_lr_multiplier <= 0:
+        raise ValueError("--aux_adamw_lr_multiplier must be positive")
+    if args.aux_adamw_lr_multiplier != 1.0 and args.optimizer != "muon":
+        raise ValueError("--aux_adamw_lr_multiplier requires --optimizer muon")
+    if not 0.0 < args.stable_decay_fraction <= 1.0:
+        raise ValueError("--stable_decay_fraction must be in (0, 1]")
+    if args.scheduler == 'stable_linear_decay' and args.warmup_steps != 0:
+        raise ValueError(
+            "--scheduler stable_linear_decay starts at peak LR and requires "
+            "--warmup_ratio 0"
+        )
     if args.spectral_lr_scaling_offset < 0:
         raise ValueError("--spectral_lr_scaling_offset must be non-negative")
     if args.lowrank_ffn_lr_multiplier <= 0:
@@ -1433,7 +1467,9 @@ def main():
             param_groups.append({
                 'params': hidden_gains_biases + nonhidden_params,
                 'use_muon': False,
-                'lr': args.max_lr,
+                'lr': auxiliary_adamw_lr(
+                    args.max_lr, args.aux_adamw_lr_multiplier
+                ),
                 'betas': (args.adam_beta1, args.adam_beta2),
                 'weight_decay': args.nh_weight_decay,
                 'is_lowrank': False
@@ -1490,7 +1526,9 @@ def main():
                  lr=args.max_lr, weight_decay=args.weight_decay,
                  adjust_lr_fn=args.adjust_muon_lr),
             dict(params=hidden_gains_biases + nonhidden_params, use_muon=False,
-                 lr=args.max_lr, betas=(args.adam_beta1, args.adam_beta2),
+                 lr=auxiliary_adamw_lr(
+                     args.max_lr, args.aux_adamw_lr_multiplier
+                 ), betas=(args.adam_beta1, args.adam_beta2),
                  weight_decay=args.weight_decay),
         ]
         return param_groups
@@ -1539,7 +1577,9 @@ def main():
                     params=hidden_gains_biases + nonhidden_params,
                     use_muon=False,
                     use_lora_muon=False,
-                    lr=args.max_lr,
+                    lr=auxiliary_adamw_lr(
+                        args.max_lr, args.aux_adamw_lr_multiplier
+                    ),
                     betas=(args.adam_beta1, args.adam_beta2),
                     weight_decay=args.weight_decay,
                     is_lowrank=False,
@@ -1627,7 +1667,11 @@ def main():
         print(f"\nOptimizer: {args.optimizer}")
         if args.optimizer == 'muon':
             print(f"  Learning rate: {args.max_lr}")
-            print(f"  Aux Adam LR (gains/biases/embeddings): {args.max_lr}")
+            print(
+                "  Aux Adam LR (gains/biases/embeddings): "
+                f"{auxiliary_adamw_lr(args.max_lr, args.aux_adamw_lr_multiplier)} "
+                f"({args.aux_adamw_lr_multiplier:g}x Muon base)"
+            )
             print(f"  Adam betas: ({args.adam_beta1}, {args.adam_beta2})")
             print(f"  Low-rank optimizer: {args.lowrank_optimizer}")
             if args.lowrank_optimizer == 'lora_muon':
@@ -1678,6 +1722,8 @@ def main():
         private_param_store[vw] = {n: param_dict[n].data.clone() for n in private_names}
         if private_params_list:
             private_optimizers[vw] = create_optimizer(private_params_list, private_names)
+            for group in private_optimizers[vw].param_groups:
+                group['scheduled_peak_lr'] = group['lr']
         else:
             private_optimizers[vw] = None
 
@@ -1685,7 +1731,19 @@ def main():
     if rank == 0:
         print(f"\nSetting up {args.scheduler} scheduler...")
 
-    if args.scheduler == 'wsd':
+    if args.scheduler == 'stable_linear_decay':
+        def stable_lr_lambda(update_index):
+            return stable_linear_decay_factor(
+                update_index,
+                args.lr_schedule_steps,
+                args.stable_decay_fraction,
+            )
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            shared_optimizer,
+            lr_lambda=[stable_lr_lambda] * len(shared_optimizer.param_groups),
+        )
+    elif args.scheduler == 'wsd':
         # WSD (Warmup-Stable-Decay) scheduler
         lr_lambda = wsd_schedule(
             n_iterations=args.lr_schedule_steps,
@@ -1973,7 +2031,17 @@ def main():
                 print("Restored Python, NumPy, Torch CPU, and CUDA RNG state")
 
     print(f"Worker {rank} starting training...")
-    if args.scheduler == 'wsd':
+    if args.scheduler == 'stable_linear_decay':
+        stable_steps = args.lr_schedule_steps - math.ceil(
+            args.lr_schedule_steps * args.stable_decay_fraction
+        )
+        print(
+            "Learning rate schedule: stable_linear_decay "
+            f"(peak LR from update 1; {stable_steps} flat updates; "
+            f"final {args.stable_decay_fraction * 100:.1f}% decays linearly to zero; "
+            f"schedule horizon {args.lr_schedule_steps})"
+        )
+    elif args.scheduler == 'wsd':
         print(f"Learning rate schedule: WSD (run for {args.total_steps} steps; schedule horizon {args.lr_schedule_steps}, warmup for {args.warmup_steps} steps [{args.warmup_ratio*100:.1f}% of schedule], stable phase, then decay to {0.1 * args.max_lr:.6f})")
     else:
         print(f"Learning rate schedule: {args.scheduler} (run for {args.total_steps} steps; schedule horizon {args.lr_schedule_steps}, warmup for {args.warmup_steps} steps [{args.warmup_ratio*100:.1f}% of schedule], then decay to {args.min_lr_factor * args.max_lr:.6f})")
@@ -2019,6 +2087,9 @@ def main():
             embedding_init_std=(
                 1.0 if args.embedding_init_std is None else args.embedding_init_std
             ),
+            scheduler=args.scheduler,
+            aux_adamw_lr_multiplier=args.aux_adamw_lr_multiplier,
+            stable_decay_fraction=args.stable_decay_fraction,
         )
         print(f"Mechanistic diagnostics: {mechanistic_output_dir}")
 
@@ -2036,6 +2107,9 @@ def main():
             world_size=world_size,
             product_interval=args.lightweight_product_interval,
             adjust_muon_lr=args.adjust_muon_lr,
+            scheduler=args.scheduler,
+            aux_adamw_lr_multiplier=args.aux_adamw_lr_multiplier,
+            stable_decay_fraction=args.stable_decay_fraction,
         )
         if rank == 0:
             print(
@@ -2063,9 +2137,13 @@ def main():
 
             # Set lr for private optimizer to match shared scheduler's current LR
             if private_optimizers[vw] is not None:
-                current_lr = shared_optimizer.param_groups[0]['lr']
+                shared_group = shared_optimizer.param_groups[0]
+                shared_peak_lr = shared_group.get(
+                    'initial_lr', shared_group['lr']
+                )
+                schedule_factor = shared_group['lr'] / shared_peak_lr
                 for pg in private_optimizers[vw].param_groups:
-                    pg['lr'] = current_lr
+                    pg['lr'] = pg['scheduled_peak_lr'] * schedule_factor
 
             # Zero grads for private params
             if private_optimizers[vw] is not None:
@@ -2479,6 +2557,13 @@ def main():
                 'total_tflops_forward': total_flops_forward / 1e12,
                 'total_tflops_backward': total_flops_backward / 1e12,
             }
+            aux_adamw_lrs = [
+                float(group['lr'])
+                for group in shared_optimizer.param_groups
+                if not group.get('use_muon', False)
+            ]
+            if args.optimizer == 'muon' and aux_adamw_lrs:
+                log_dict['aux_adamw_learning_rate'] = aux_adamw_lrs[0]
 
             # Add self-guided metrics if enabled
             if args.self_guided and alpha_scheduler is not None:

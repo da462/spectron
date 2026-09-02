@@ -364,6 +364,9 @@ class MechanisticDiagnostics:
         spectral_lr_target: str,
         weight_decay: float,
         embedding_init_std: float,
+        scheduler: str = "unknown",
+        aux_adamw_lr_multiplier: float = 1.0,
+        stable_decay_fraction: float = 0.3,
     ) -> None:
         normalized_device = normalize_device(device)
         payload = torch.load(diagnostic_batch_path, map_location="cpu", weights_only=True)
@@ -384,6 +387,9 @@ class MechanisticDiagnostics:
         self.spectral_lr_target = spectral_lr_target
         self.weight_decay = weight_decay
         self.embedding_init_std = embedding_init_std
+        self.scheduler = scheduler
+        self.aux_adamw_lr_multiplier = aux_adamw_lr_multiplier
+        self.stable_decay_fraction = stable_decay_fraction
         self.pending: dict[str, Any] | None = None
         self._write_metadata()
 
@@ -396,6 +402,9 @@ class MechanisticDiagnostics:
             "total_steps": self.total_steps,
             "embedding_init_std": self.embedding_init_std,
             "adjust_muon_lr": self.adjust_muon_lr,
+            "aux_adamw_lr_multiplier": self.aux_adamw_lr_multiplier,
+            "scheduler": self.scheduler,
+            "stable_decay_fraction": self.stable_decay_fraction,
             "spectral_lr_scaling": self.spectral_lr_scaling,
             "spectral_lr_target": self.spectral_lr_target,
             "weight_decay": self.weight_decay,

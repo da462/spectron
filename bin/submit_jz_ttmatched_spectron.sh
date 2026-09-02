@@ -53,6 +53,10 @@ SUBMIT_SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-2048}"
 SUBMIT_MULTIPLE_OF="${MULTIPLE_OF:-256}"
 SUBMIT_ROPE_THETA="${ROPE_THETA:-10000}"
 SUBMIT_ADJUST_MUON_LR="${ADJUST_MUON_LR:-original}"
+SUBMIT_AUX_ADAMW_LR_MULTIPLIER="${AUX_ADAMW_LR_MULTIPLIER:-1.0}"
+SUBMIT_SCHEDULER="${SCHEDULER:-cosine}"
+SUBMIT_WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
+SUBMIT_STABLE_DECAY_FRACTION="${STABLE_DECAY_FRACTION:-0.3}"
 SUBMIT_LOWRANK_OPTIMIZER="${LOWRANK_OPTIMIZER:-factor_muon}"
 SUBMIT_LR_TAG="${SUBMIT_MAX_LR//./p}"
 SUBMIT_LR_TAG="${SUBMIT_LR_TAG//e-/em}"
@@ -68,6 +72,14 @@ if [[ "$SUBMIT_USE_FLEX_ATTN" == "0" ]]; then
 fi
 if [[ "$SUBMIT_TT_STYLE_INIT" == "1" ]]; then
   JOB_SUFFIX="${JOB_SUFFIX}_ttinit"
+fi
+if [[ "$SUBMIT_SCHEDULER" != "cosine" ]]; then
+  SCHED_TAG="${SUBMIT_SCHEDULER//[^a-zA-Z0-9]/}"
+  JOB_SUFFIX="${JOB_SUFFIX}_sched${SCHED_TAG}"
+fi
+if [[ "$SUBMIT_AUX_ADAMW_LR_MULTIPLIER" != "1" && "$SUBMIT_AUX_ADAMW_LR_MULTIPLIER" != "1.0" && "$SUBMIT_AUX_ADAMW_LR_MULTIPLIER" != "1.00" ]]; then
+  AUXLR_TAG="${SUBMIT_AUX_ADAMW_LR_MULTIPLIER//./p}"
+  JOB_SUFFIX="${JOB_SUFFIX}_auxlr${AUXLR_TAG}"
 fi
 if [[ -n "$SUBMIT_EMBEDDING_INIT_STD" ]]; then
   EMBSTD_TAG="${SUBMIT_EMBEDDING_INIT_STD//./p}"
@@ -310,6 +322,10 @@ SEQUENCE_LENGTH="\${SEQUENCE_LENGTH:-$SUBMIT_SEQUENCE_LENGTH}"
 MULTIPLE_OF="\${MULTIPLE_OF:-$SUBMIT_MULTIPLE_OF}"
 ROPE_THETA="\${ROPE_THETA:-$SUBMIT_ROPE_THETA}"
 ADJUST_MUON_LR="\${ADJUST_MUON_LR:-$SUBMIT_ADJUST_MUON_LR}"
+AUX_ADAMW_LR_MULTIPLIER="\${AUX_ADAMW_LR_MULTIPLIER:-$SUBMIT_AUX_ADAMW_LR_MULTIPLIER}"
+SCHEDULER="\${SCHEDULER:-$SUBMIT_SCHEDULER}"
+WARMUP_RATIO="\${WARMUP_RATIO:-$SUBMIT_WARMUP_RATIO}"
+STABLE_DECAY_FRACTION="\${STABLE_DECAY_FRACTION:-$SUBMIT_STABLE_DECAY_FRACTION}"
 LOWRANK_OPTIMIZER="\${LOWRANK_OPTIMIZER:-$SUBMIT_LOWRANK_OPTIMIZER}"
 WARMUP_START_FACTOR="\${WARMUP_START_FACTOR:-0.0}"
 SKIP_FINAL_EVAL="\${SKIP_FINAL_EVAL:-1}"
@@ -327,6 +343,14 @@ if [[ "\$USE_FLEX_ATTN" == "0" ]]; then
 fi
 if [[ "\$TT_STYLE_INIT" == "1" ]]; then
   RUN_SUFFIX="\${RUN_SUFFIX}_ttinit"
+fi
+if [[ "\$SCHEDULER" != "cosine" ]]; then
+  SCHED_TAG="\${SCHEDULER//[^a-zA-Z0-9]/}"
+  RUN_SUFFIX="\${RUN_SUFFIX}_sched\${SCHED_TAG}"
+fi
+if [[ "\$AUX_ADAMW_LR_MULTIPLIER" != "1" && "\$AUX_ADAMW_LR_MULTIPLIER" != "1.0" && "\$AUX_ADAMW_LR_MULTIPLIER" != "1.00" ]]; then
+  AUXLR_TAG="\${AUX_ADAMW_LR_MULTIPLIER//./p}"
+  RUN_SUFFIX="\${RUN_SUFFIX}_auxlr\${AUXLR_TAG}"
 fi
 if [[ -n "\$EMBEDDING_INIT_STD" ]]; then
   EMBSTD_TAG="\${EMBEDDING_INIT_STD//./p}"
@@ -531,7 +555,8 @@ fi
 
 echo "Spectron TT-matched run"
 echo "  model_size=\$MODEL_SIZE_LABEL hidden=\$HIDDEN_SIZE layers=\$NUM_LAYERS heads=\$NUM_HEADS kv_heads=\$N_KV_HEADS"
-echo "  optimizer=\$OPTIMIZER lowrank_optimizer=\$LOWRANK_OPTIMIZER adjust_muon_lr=\$ADJUST_MUON_LR run_mode=\$RUN_MODE rope_theta=\$ROPE_THETA seq_len=\$SEQUENCE_LENGTH total_steps=\$TOTAL_STEPS lr_schedule_steps=\$LR_SCHEDULE_STEPS"
+echo "  optimizer=\$OPTIMIZER lowrank_optimizer=\$LOWRANK_OPTIMIZER adjust_muon_lr=\$ADJUST_MUON_LR aux_adamw_lr_multiplier=\$AUX_ADAMW_LR_MULTIPLIER run_mode=\$RUN_MODE rope_theta=\$ROPE_THETA seq_len=\$SEQUENCE_LENGTH total_steps=\$TOTAL_STEPS lr_schedule_steps=\$LR_SCHEDULE_STEPS"
+echo "  scheduler=\$SCHEDULER warmup_ratio=\$WARMUP_RATIO stable_decay_fraction=\$STABLE_DECAY_FRACTION"
 echo "  lr=\$MAX_LR min_lr_factor=\$MIN_LR_FACTOR warmup_start_factor=\$WARMUP_START_FACTOR weight_decay=\$WEIGHT_DECAY nh_weight_decay=\$NH_WEIGHT_DECAY batch=\$GLOBAL_BATCH_SIZE micro_batch=\$MICRO_BATCH_SIZE"
 echo "  use_flex_attn=\$USE_FLEX_ATTN tt_style_init=\$TT_STYLE_INIT embedding_init_std=\${EMBEDDING_INIT_STD:-default}"
 echo "  mechanistic_diagnostics=\$MECHANISTIC_DIAGNOSTICS diagnostic_batch=\${MECHANISTIC_DIAGNOSTIC_BATCH:-none}"
@@ -570,18 +595,20 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" --master_port "\$MASTER_PORT" 
   --optimizer "\$OPTIMIZER" \\
   --lowrank_optimizer "\$LOWRANK_OPTIMIZER" \\
   --adjust_muon_lr "\$ADJUST_MUON_LR" \\
+  --aux_adamw_lr_multiplier "\$AUX_ADAMW_LR_MULTIPLIER" \\
   --max_lr "\$MAX_LR" \\
   --weight_decay "\$WEIGHT_DECAY" \\
   --nh_weight_decay "\$NH_WEIGHT_DECAY" \\
   --adam_beta1 0.9 \\
   --adam_beta2 0.95 \\
-  --scheduler cosine \\
+  --scheduler "\$SCHEDULER" \\
+  --stable_decay_fraction "\$STABLE_DECAY_FRACTION" \\
   --min_lr_factor "\$MIN_LR_FACTOR" \\
   --batch_size "\$GLOBAL_BATCH_SIZE" \\
   --micro_batch_size "\$MICRO_BATCH_SIZE" \\
   --total_steps "\$TOTAL_STEPS" \\
   --lr_schedule_steps "\$LR_SCHEDULE_STEPS" \\
-  --warmup_ratio 0.05 \\
+  --warmup_ratio "\$WARMUP_RATIO" \\
   --warmup_start_factor "\$WARMUP_START_FACTOR" \\
   --log_interval "\$LOG_INTERVAL" \\
   --eval_interval "\$EVAL_INTERVAL" \\
