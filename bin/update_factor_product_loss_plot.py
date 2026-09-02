@@ -127,6 +127,22 @@ def tail_mean(rows: list[tuple[int, float]], count: int = 100) -> float:
     return sum(value for _, value in tail) / len(tail)
 
 
+def matched_tail_ppl_gap(
+    baseline: list[tuple[int, float]],
+    candidate: list[tuple[int, float]],
+    count: int = 100,
+) -> tuple[int, float] | None:
+    baseline_by_step = dict(baseline)
+    candidate_by_step = dict(candidate)
+    shared = sorted(set(baseline_by_step) & set(candidate_by_step))
+    if len(shared) < count:
+        return None
+    steps = shared[-count:]
+    baseline_ce = sum(baseline_by_step[step] for step in steps) / count
+    candidate_ce = sum(candidate_by_step[step] for step in steps) / count
+    return steps[-1], 100.0 * (math.exp(candidate_ce - baseline_ce) - 1.0)
+
+
 def write_csv(path: Path, curves: dict[str, list[tuple[int, float]]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:
@@ -192,6 +208,25 @@ def plot(
         axis.set_ylabel("Training cross-entropy")
         axis.grid(True, alpha=0.20)
     axes[0].legend(frameon=False, fontsize=9)
+    baseline = curves.get("Factor-Muon", [])
+    comparisons = []
+    for run in RUNS[1:]:
+        result = matched_tail_ppl_gap(baseline, curves.get(run.label, []))
+        if result is not None:
+            step, gap = result
+            comparisons.append(
+                f"{run.label}: {gap:+.2f}% PPL at matched tail-100 ending step {step}"
+            )
+    if comparisons:
+        axes[1].text(
+            0.02,
+            0.04,
+            "\n".join(comparisons),
+            transform=axes[1].transAxes,
+            fontsize=8.5,
+            va="bottom",
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.82},
+        )
     available = set(curves)
     absent = [run.label for run in RUNS if run.label not in available]
     subtitle = "LR and schedule 7e-3 | WD 0.1 | embedding std 0.02 | 4-rank mean"
