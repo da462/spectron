@@ -29,8 +29,8 @@ class Run:
 
 RUNS = (
     Run("Factor-Muon", "1656518", "#222222"),
-    Run("Product-AdamRMS", "1671865", "#167d9a"),
-    Run("HeadClip", "1671866", "#b94c3a"),
+    Run("Rank-aware Product-AdamRMS", "1673742", "#167d9a"),
+    Run("HeadClip", "1673961", "#b94c3a"),
 )
 
 
