@@ -560,6 +560,7 @@ class ProductVariantLauncherTests(unittest.TestCase):
         self.assertIn("WEIGHT_DECAY=0.1", launcher)
         self.assertIn("ADJUST_MUON_LR=match_rms_adamw", launcher)
         self.assertIn("EMBEDDING_INIT_STD=0.02", launcher)
+        self.assertIn('MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-16}"', launcher)
 
 
 if __name__ == "__main__":
