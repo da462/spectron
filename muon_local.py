@@ -2,6 +2,8 @@ import torch
 import torch.distributed as dist
 import math
 
+from lora_muon import apply_lora_muon_step, lora_muon_factor_directions
+
 
 def _notify_update(optimizer, parameter, update, group, optimizer_kind):
     observer = getattr(optimizer, "update_observer", None)
@@ -214,7 +216,16 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
     def __init__(self, param_groups):
         for group in param_groups:
             assert "use_muon" in group
-            if group["use_muon"]:
+            if group.get("use_lora_muon", False):
+                if group["use_muon"]:
+                    raise ValueError("LoRA-Muon pair groups cannot also use factor Muon")
+                if len(group["params"]) != 2:
+                    raise ValueError("LoRA-Muon groups require exactly one A/B pair")
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                group["lora_pair_index"] = group.get("lora_pair_index", 0)
+            elif group["use_muon"]:
                 group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
                 # defaults
                 group["lr"] = group.get("lr", 0.02)
@@ -241,7 +252,47 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            if group["use_muon"]:
+            if group.get("use_lora_muon", False):
+                factor_a, factor_b = group["params"]
+                for parameter in (factor_a, factor_b):
+                    if parameter.grad is None:
+                        parameter.grad = torch.zeros_like(parameter)
+                    state = self.state[parameter]
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(parameter)
+                    state["momentum_buffer"].lerp_(
+                        parameter.grad, 1 - group["momentum"]
+                    )
+
+                distributed = dist.is_available() and dist.is_initialized()
+                world_size = dist.get_world_size() if distributed else 1
+                rank = dist.get_rank() if distributed else 0
+                owner = int(group["lora_pair_index"]) % world_size
+                if rank == owner:
+                    direction_a, direction_b = lora_muon_factor_directions(
+                        factor_a,
+                        factor_b,
+                        self.state[factor_a]["momentum_buffer"],
+                        self.state[factor_b]["momentum_buffer"],
+                    )
+                    _notify_update(
+                        self, factor_a, -direction_a, group, "lora_muon"
+                    )
+                    _notify_update(
+                        self, factor_b, -direction_b, group, "lora_muon"
+                    )
+                    apply_lora_muon_step(
+                        factor_a,
+                        factor_b,
+                        direction_a,
+                        direction_b,
+                        lr=group["lr"],
+                        weight_decay=group["weight_decay"],
+                    )
+                if distributed:
+                    dist.broadcast(factor_a, src=owner)
+                    dist.broadcast(factor_b, src=owner)
+            elif group["use_muon"]:
                 params = group["params"]
                 params_pad = params + [torch.empty_like(params[-1])] * (dist.get_world_size() - len(params) % dist.get_world_size())
                 for base_i in range(len(params))[::dist.get_world_size()]:
@@ -285,7 +336,15 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
     def __init__(self, param_groups):
         for group in param_groups:
             assert "use_muon" in group
-            if group["use_muon"]:
+            if group.get("use_lora_muon", False):
+                if group["use_muon"]:
+                    raise ValueError("LoRA-Muon pair groups cannot also use factor Muon")
+                if len(group["params"]) != 2:
+                    raise ValueError("LoRA-Muon groups require exactly one A/B pair")
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+            elif group["use_muon"]:
                 # defaults
                 group["lr"] = group.get("lr", 0.02)
                 group["momentum"] = group.get("momentum", 0.95)
@@ -312,7 +371,34 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            if group["use_muon"]:
+            if group.get("use_lora_muon", False):
+                factor_a, factor_b = group["params"]
+                for parameter in (factor_a, factor_b):
+                    if parameter.grad is None:
+                        parameter.grad = torch.zeros_like(parameter)
+                    state = self.state[parameter]
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(parameter)
+                    state["momentum_buffer"].lerp_(
+                        parameter.grad, 1 - group["momentum"]
+                    )
+                direction_a, direction_b = lora_muon_factor_directions(
+                    factor_a,
+                    factor_b,
+                    self.state[factor_a]["momentum_buffer"],
+                    self.state[factor_b]["momentum_buffer"],
+                )
+                _notify_update(self, factor_a, -direction_a, group, "lora_muon")
+                _notify_update(self, factor_b, -direction_b, group, "lora_muon")
+                apply_lora_muon_step(
+                    factor_a,
+                    factor_b,
+                    direction_a,
+                    direction_b,
+                    lr=group["lr"],
+                    weight_decay=group["weight_decay"],
+                )
+            elif group["use_muon"]:
                 for p in group["params"]:
                     if p.grad is None:
                         # continue

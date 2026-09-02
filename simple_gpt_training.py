@@ -43,6 +43,7 @@ RESUME_CRITICAL_ARGS = (
     "virtual_workers_per_gpu",
     "seed",
     "optimizer",
+    "lowrank_optimizer",
     "scheduler",
     "lr_schedule_steps",
     "warmup_steps",
@@ -860,6 +861,13 @@ def main():
     parser.add_argument('--adam_beta2', type=float, default=0.95, help='Adam beta2 parameter')
     parser.add_argument('--adjust_muon_lr', type=str, default='original', choices=['original', 'match_rms_adamw', 'none'],
                         help='Muon learning rate adjustment function: original (sqrt(max(1, A/B))), match_rms_adamw (0.2*sqrt(max(A,B))), or none (no adjustment)')
+    parser.add_argument(
+        '--lowrank_optimizer',
+        type=str,
+        default='factor_muon',
+        choices=['factor_muon', 'lora_muon'],
+        help='Optimizer geometry for native low-rank A/B pairs',
+    )
     parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'wsd'],
                         help='Learning rate scheduler to use: cosine or wsd (warmup-stable-decay)')
     parser.add_argument('--min_lr_factor', type=float, default=0.1,
@@ -1069,6 +1077,27 @@ def main():
             )
     if args.low_rank_attention_per_head_rank is not None and args.low_rank_attention_per_head_rank <= 0:
         raise ValueError("--low_rank_attention_per_head_rank must be positive")
+    if args.lowrank_optimizer == 'lora_muon':
+        if args.optimizer != 'muon':
+            raise ValueError("--lowrank_optimizer=lora_muon requires --optimizer=muon")
+        if not args.low_rank or not args.disable_c:
+            raise ValueError(
+                "--lowrank_optimizer=lora_muon requires AB low-rank layers "
+                "(--low_rank --disable_c)"
+            )
+        if 'attention' not in args.exclude_modules:
+            raise ValueError(
+                "The initial LoRA-Muon probe supports FFN-only factorization; "
+                "exclude attention"
+            )
+        if args.spectral_lr_scaling:
+            raise ValueError("LoRA-Muon cannot be combined with Spectron LR scaling")
+        if args.lowrank_ffn_lr_multiplier != 1.0:
+            raise ValueError("LoRA-Muon uses its scheduled product LR directly")
+        if lowrank_weight_decay_overridden:
+            raise ValueError(
+                "LoRA-Muon applies the base weight decay with its split product rule"
+            )
     if args.low_rank_attention_factorization == "per_head":
         if not args.low_rank:
             raise ValueError("--low_rank_attention_factorization=per_head requires --low_rank")
@@ -1458,8 +1487,93 @@ def main():
         ]
         return param_groups
 
+    def build_lora_muon_optim_groups(param_list, param_names):
+        """Keep dense Muon/Adam routing and replace only FFN A/B pair updates."""
+        hidden_weights = []
+        hidden_gains_biases = []
+        nonhidden_params = []
+        factor_pairs = {}
+
+        for name, param in zip(param_names, param_list):
+            if name.endswith('.A') or name.endswith('.B'):
+                if '.feed_forward.' not in name:
+                    raise ValueError(
+                        f"LoRA-Muon probe received a non-FFN factor: {name}"
+                    )
+                pair_name, factor_name = name.rsplit('.', 1)
+                factor_pairs.setdefault(pair_name, {})[factor_name] = (name, param)
+                continue
+
+            if 'layers.' in name:
+                if param.dim() >= 2:
+                    hidden_weights.append(param)
+                else:
+                    hidden_gains_biases.append(param)
+            else:
+                nonhidden_params.append(param)
+
+        param_groups = []
+        if hidden_weights:
+            param_groups.append(
+                dict(
+                    params=hidden_weights,
+                    use_muon=True,
+                    use_lora_muon=False,
+                    lr=args.max_lr,
+                    weight_decay=args.weight_decay,
+                    adjust_lr_fn=args.adjust_muon_lr,
+                    is_lowrank=False,
+                )
+            )
+        if hidden_gains_biases or nonhidden_params:
+            param_groups.append(
+                dict(
+                    params=hidden_gains_biases + nonhidden_params,
+                    use_muon=False,
+                    use_lora_muon=False,
+                    lr=args.max_lr,
+                    betas=(args.adam_beta1, args.adam_beta2),
+                    weight_decay=args.weight_decay,
+                    is_lowrank=False,
+                )
+            )
+
+        for pair_index, pair_name in enumerate(sorted(factor_pairs)):
+            factors = factor_pairs[pair_name]
+            if set(factors) != {'A', 'B'}:
+                raise ValueError(
+                    f"LoRA-Muon requires one A and B for {pair_name}, got "
+                    f"{sorted(factors)}"
+                )
+            name_a, factor_a = factors['A']
+            name_b, factor_b = factors['B']
+            param_groups.append(
+                dict(
+                    params=[factor_a, factor_b],
+                    use_muon=False,
+                    use_lora_muon=True,
+                    lr=args.max_lr,
+                    momentum=0.95,
+                    weight_decay=args.weight_decay,
+                    is_lowrank=True,
+                    pair_name=pair_name,
+                    param_names=(name_a, name_b),
+                    lora_pair_index=pair_index,
+                    lowrank_module_type='ffn',
+                )
+            )
+        if not factor_pairs:
+            raise ValueError("LoRA-Muon found no low-rank A/B pairs")
+        return param_groups
+
     def create_optimizer(param_list, param_names=None, use_lowrank_individual_groups=False):
         """Create optimizer based on args.optimizer"""
+        if args.lowrank_optimizer == 'lora_muon':
+            if param_names is None:
+                raise ValueError("param_names required for LoRA-Muon")
+            return MuonWithAuxAdam(
+                build_lora_muon_optim_groups(param_list, param_names)
+            )
         if use_lowrank_individual_groups and param_names is not None:
             # Use Muon with individual low-rank groups for spectral LR scaling
             # and/or explicit low-rank FFN LR multipliers.
@@ -1497,6 +1611,10 @@ def main():
             print(f"  Learning rate: {args.max_lr}")
             print(f"  Aux Adam LR (gains/biases/embeddings): {args.max_lr}")
             print(f"  Adam betas: ({args.adam_beta1}, {args.adam_beta2})")
+            print(f"  Low-rank optimizer: {args.lowrank_optimizer}")
+            if args.lowrank_optimizer == 'lora_muon':
+                print("  FFN factor LR: direct LoRA-Muon product radius")
+                print("  FFN factor WD: split product decay")
         else:
             print(f"  Learning rate: {args.max_lr}")
             print(f"  Adam betas: ({args.adam_beta1}, {args.adam_beta2})")

@@ -53,6 +53,7 @@ SUBMIT_SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-2048}"
 SUBMIT_MULTIPLE_OF="${MULTIPLE_OF:-256}"
 SUBMIT_ROPE_THETA="${ROPE_THETA:-10000}"
 SUBMIT_ADJUST_MUON_LR="${ADJUST_MUON_LR:-original}"
+SUBMIT_LOWRANK_OPTIMIZER="${LOWRANK_OPTIMIZER:-factor_muon}"
 SUBMIT_LR_TAG="${SUBMIT_MAX_LR//./p}"
 SUBMIT_LR_TAG="${SUBMIT_LR_TAG//e-/em}"
 SUBMIT_LR_TAG="${SUBMIT_LR_TAG//e+/ep}"
@@ -80,6 +81,9 @@ if [[ "$SUBMIT_LIGHTWEIGHT_DIAGNOSTICS" == "1" ]]; then
 fi
 if [[ "$SUBMIT_SPECTRAL_LR_SCALING" == "1" ]]; then
   JOB_SUFFIX="${JOB_SUFFIX}_spectron"
+fi
+if [[ "$SUBMIT_LOWRANK_OPTIMIZER" == "lora_muon" ]]; then
+  JOB_SUFFIX="${JOB_SUFFIX}_loramuon"
 fi
 if [[ "$SUBMIT_SPECTRAL_LR_TARGET" != "all" ]]; then
   TARGET_TAG="${SUBMIT_SPECTRAL_LR_TARGET//[^a-zA-Z0-9]/}"
@@ -291,6 +295,7 @@ SEQUENCE_LENGTH="\${SEQUENCE_LENGTH:-$SUBMIT_SEQUENCE_LENGTH}"
 MULTIPLE_OF="\${MULTIPLE_OF:-$SUBMIT_MULTIPLE_OF}"
 ROPE_THETA="\${ROPE_THETA:-$SUBMIT_ROPE_THETA}"
 ADJUST_MUON_LR="\${ADJUST_MUON_LR:-$SUBMIT_ADJUST_MUON_LR}"
+LOWRANK_OPTIMIZER="\${LOWRANK_OPTIMIZER:-$SUBMIT_LOWRANK_OPTIMIZER}"
 WARMUP_START_FACTOR="\${WARMUP_START_FACTOR:-0.0}"
 SKIP_FINAL_EVAL="\${SKIP_FINAL_EVAL:-1}"
 LR_TAG="\${MAX_LR//./p}"
@@ -317,6 +322,9 @@ if [[ "\$MECHANISTIC_DIAGNOSTICS" == "1" ]]; then
 fi
 if [[ "\$SPECTRAL_LR_SCALING" == "1" ]]; then
   RUN_SUFFIX="\${RUN_SUFFIX}_spectron"
+fi
+if [[ "\$LOWRANK_OPTIMIZER" == "lora_muon" ]]; then
+  RUN_SUFFIX="\${RUN_SUFFIX}_loramuon"
 fi
 if [[ "\$SPECTRAL_LR_TARGET" != "all" ]]; then
   TARGET_TAG="\${SPECTRAL_LR_TARGET//[^a-zA-Z0-9]/}"
@@ -502,7 +510,7 @@ fi
 
 echo "Spectron TT-matched run"
 echo "  model_size=\$MODEL_SIZE_LABEL hidden=\$HIDDEN_SIZE layers=\$NUM_LAYERS heads=\$NUM_HEADS kv_heads=\$N_KV_HEADS"
-echo "  optimizer=\$OPTIMIZER adjust_muon_lr=\$ADJUST_MUON_LR run_mode=\$RUN_MODE rope_theta=\$ROPE_THETA seq_len=\$SEQUENCE_LENGTH total_steps=\$TOTAL_STEPS lr_schedule_steps=\$LR_SCHEDULE_STEPS"
+echo "  optimizer=\$OPTIMIZER lowrank_optimizer=\$LOWRANK_OPTIMIZER adjust_muon_lr=\$ADJUST_MUON_LR run_mode=\$RUN_MODE rope_theta=\$ROPE_THETA seq_len=\$SEQUENCE_LENGTH total_steps=\$TOTAL_STEPS lr_schedule_steps=\$LR_SCHEDULE_STEPS"
 echo "  lr=\$MAX_LR min_lr_factor=\$MIN_LR_FACTOR warmup_start_factor=\$WARMUP_START_FACTOR weight_decay=\$WEIGHT_DECAY nh_weight_decay=\$NH_WEIGHT_DECAY batch=\$GLOBAL_BATCH_SIZE micro_batch=\$MICRO_BATCH_SIZE"
 echo "  use_flex_attn=\$USE_FLEX_ATTN tt_style_init=\$TT_STYLE_INIT embedding_init_std=\${EMBEDDING_INIT_STD:-default}"
 echo "  mechanistic_diagnostics=\$MECHANISTIC_DIAGNOSTICS diagnostic_batch=\${MECHANISTIC_DIAGNOSTIC_BATCH:-none}"
@@ -539,6 +547,7 @@ exec torchrun --nproc_per_node="\$NPROC_PER_NODE" --master_port "\$MASTER_PORT" 
   --multiple_of "\$MULTIPLE_OF" \\
   --rope_theta "\$ROPE_THETA" \\
   --optimizer "\$OPTIMIZER" \\
+  --lowrank_optimizer "\$LOWRANK_OPTIMIZER" \\
   --adjust_muon_lr "\$ADJUST_MUON_LR" \\
   --max_lr "\$MAX_LR" \\
   --weight_decay "\$WEIGHT_DECAY" \\
