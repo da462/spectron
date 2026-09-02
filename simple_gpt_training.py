@@ -1557,7 +1557,7 @@ def main():
                     weight_decay=args.weight_decay,
                     is_lowrank=True,
                     pair_name=pair_name,
-                    param_names=(name_a, name_b),
+                    pair_param_names=(name_a, name_b),
                     lora_pair_index=pair_index,
                     lowrank_module_type='ffn',
                 )

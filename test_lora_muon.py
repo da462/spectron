@@ -161,6 +161,39 @@ class LoRAMuonMathTests(unittest.TestCase):
 
 
 class LoRAMuonOptimizerTests(unittest.TestCase):
+    def test_pair_group_can_coexist_with_dense_and_adam_groups(self) -> None:
+        factor_a = torch.nn.Parameter(torch.randn(12, 4))
+        factor_b = torch.nn.Parameter(torch.randn(4, 10))
+        dense = torch.nn.Parameter(torch.randn(8, 8))
+        bias = torch.nn.Parameter(torch.randn(8))
+        optimizer = SingleDeviceMuonWithAuxAdam(
+            [
+                {
+                    "params": [dense],
+                    "use_muon": True,
+                    "use_lora_muon": False,
+                    "lr": 0.005,
+                },
+                {
+                    "params": [bias],
+                    "use_muon": False,
+                    "use_lora_muon": False,
+                    "lr": 0.005,
+                },
+                {
+                    "params": [factor_a, factor_b],
+                    "use_muon": False,
+                    "use_lora_muon": True,
+                    "lr": 0.005,
+                    "pair_param_names": ("ffn.A", "ffn.B"),
+                },
+            ]
+        )
+        for parameter in (factor_a, factor_b, dense, bias):
+            parameter.grad = torch.randn_like(parameter)
+        optimizer.step()
+        self.assertTrue(all(torch.isfinite(p).all() for p in (factor_a, factor_b)))
+
     def test_one_step_updates_both_factors_once_and_stays_finite(self) -> None:
         torch.manual_seed(23)
         factor_a = torch.nn.Parameter(torch.randn(12, 4))
