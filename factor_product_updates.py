@@ -129,28 +129,22 @@ def rankaware_product_adamrms_directions(
     return direction_a, direction_b, metrics
 
 
-def _update_matmul(
-    factor_a: torch.Tensor,
-    factor_b: torch.Tensor,
-    delta_a: torch.Tensor,
-    delta_b: torch.Tensor,
-    vector: torch.Tensor,
+def _lowrank_sum_matmul(
+    terms: list[tuple[torch.Tensor, torch.Tensor]], vector: torch.Tensor
 ) -> torch.Tensor:
-    return delta_a @ ((factor_b + delta_b) @ vector) + factor_a @ (
-        delta_b @ vector
-    )
+    result = terms[0][0] @ (terms[0][1] @ vector)
+    for left, right in terms[1:]:
+        result = result + left @ (right @ vector)
+    return result
 
 
-def _update_transpose_matmul(
-    factor_a: torch.Tensor,
-    factor_b: torch.Tensor,
-    delta_a: torch.Tensor,
-    delta_b: torch.Tensor,
-    vector: torch.Tensor,
+def _lowrank_sum_transpose_matmul(
+    terms: list[tuple[torch.Tensor, torch.Tensor]], vector: torch.Tensor
 ) -> torch.Tensor:
-    return (factor_b + delta_b).mT @ (delta_a.mT @ vector) + delta_b.mT @ (
-        factor_a.mT @ vector
-    )
+    result = terms[0][1].mT @ (terms[0][0].mT @ vector)
+    for left, right in terms[1:]:
+        result = result + right.mT @ (left.mT @ vector)
+    return result
 
 
 def _deterministic_basis(
@@ -178,13 +172,34 @@ def approximate_update_top2(
     seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Approximate the top two singular triplets of the implicit product update."""
-    a = factor_a.float()
-    b = factor_b.float()
-    da = delta_a.float()
-    db = delta_b.float()
-    if left_basis is None or left_basis.shape != (a.shape[0], 2):
+    return approximate_lowrank_sum_top2(
+        [
+            (delta_a, factor_b),
+            (factor_a, delta_b),
+            (delta_a, delta_b),
+        ],
+        left_basis=left_basis,
+        power_iterations=power_iterations,
+        seed=seed,
+    )
+
+
+def approximate_lowrank_sum_top2(
+    terms: list[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    left_basis: torch.Tensor | None = None,
+    power_iterations: int = 4,
+    seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Approximate the top two singular triplets of an implicit low-rank sum."""
+    float_terms = [(left.float(), right.float()) for left, right in terms]
+    output_features = float_terms[0][0].shape[0]
+    if left_basis is None or left_basis.shape != (output_features, 2):
         left = _deterministic_basis(
-            a.shape[0], 2, device=a.device, seed=seed
+            output_features,
+            2,
+            device=float_terms[0][0].device,
+            seed=seed,
         )
     else:
         left = left_basis.float()
@@ -192,12 +207,12 @@ def approximate_update_top2(
 
     right = None
     for _ in range(max(1, power_iterations)):
-        right = _update_transpose_matmul(a, b, da, db, left)
+        right = _lowrank_sum_transpose_matmul(float_terms, left)
         right = torch.linalg.qr(right, mode="reduced").Q
-        left = _update_matmul(a, b, da, db, right)
+        left = _lowrank_sum_matmul(float_terms, right)
         left = torch.linalg.qr(left, mode="reduced").Q
     assert right is not None
-    core = left.mT @ _update_matmul(a, b, da, db, right)
+    core = left.mT @ _lowrank_sum_matmul(float_terms, right)
     core_u, singular_values, core_vh = torch.linalg.svd(
         core, full_matrices=False
     )
@@ -239,128 +254,110 @@ def _regularized_solve(gram: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     return torch.linalg.solve(gram + ridge * identity, rhs)
 
 
-def headclip_directions(
+def top_singular_pin_directions(
     factor_a: torch.Tensor,
     factor_b: torch.Tensor,
-    baseline_direction_a: torch.Tensor,
-    baseline_direction_b: torch.Tensor,
+    momentum_a: torch.Tensor,
+    momentum_b: torch.Tensor,
     *,
-    learning_rate: float,
+    target_rms: float = 0.2,
     left_basis: torch.Tensor | None = None,
-    power_iterations: int = 4,
+    power_iterations: int = 6,
     seed: int = 0,
-    collect_post_metrics: bool = False,
+    collect_spectral_metrics: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    """Apply one tangent-space correction that clips sigma1(D) to sigma2(D)."""
-    if learning_rate < 0:
-        raise ValueError("HeadClip requires a non-negative learning rate")
-    if learning_rate == 0:
-        if left_basis is None or left_basis.shape != (factor_a.shape[0], 2):
-            left_basis = _deterministic_basis(
-                factor_a.shape[0],
-                2,
-                device=factor_a.device,
-                seed=seed,
-            )
-        left_basis = torch.linalg.qr(left_basis.float(), mode="reduced").Q
-        zero = torch.zeros((), device=factor_a.device, dtype=torch.float32)
-        metrics = {
-            "pre_sigma1": zero,
-            "pre_sigma2": zero,
-            "pre_sigma1_to_sigma2": zero,
-            "target_tau": zero,
-            "head_beta": zero,
-            "head_fraction_removed": zero,
-            "pre_update_frobenius": zero,
-            "post_update_frobenius": zero,
-            "relative_frobenius_change": zero,
-        }
-        if collect_post_metrics:
-            metrics.update(
-                {
-                    "post_sigma1": zero,
-                    "post_sigma2": zero,
-                    "post_sigma1_to_sigma2": zero,
-                }
-            )
-        return (
-            baseline_direction_a,
-            baseline_direction_b,
-            left_basis,
-            metrics,
-        )
+    """Pin the original product-momentum head to one, then map it tangentially."""
     a = factor_a.float()
     b = factor_b.float()
-    delta_a = -learning_rate * baseline_direction_a.float()
-    delta_b = -learning_rate * baseline_direction_b.float()
-    singular, top_left, top_right, next_basis = approximate_update_top2(
-        a,
-        b,
-        delta_a,
-        delta_b,
+    ma = momentum_a.float()
+    mb = momentum_b.float()
+    momentum_terms = [(ma, b), (a, mb)]
+    singular, top_left, top_right, next_basis = approximate_lowrank_sum_top2(
+        momentum_terms,
         left_basis=left_basis,
         power_iterations=power_iterations,
         seed=seed,
     )
     sigma1, sigma2 = singular[0], singular[1]
-    beta = (sigma1 - sigma2).clamp_min(0.0)
+    head_shift = sigma1 - 1.0
 
-    endpoint_a = a + delta_a
-    endpoint_b = b + delta_b
     coefficient_a = _regularized_solve(
-        endpoint_a.mT @ endpoint_a, endpoint_a.mT @ top_left
+        a.mT @ a, a.mT @ top_left
     )
     coefficient_b = _regularized_solve(
-        endpoint_b @ endpoint_b.mT, endpoint_b @ top_right
+        b @ b.mT, b @ top_right
     )
-    correction_b = -beta * torch.outer(coefficient_a, top_right)
-    residual_left = top_left - endpoint_a @ coefficient_a
-    correction_a = -beta * torch.outer(residual_left, coefficient_b)
-    corrected_delta_a = (delta_a + correction_a).to(factor_a.dtype)
-    corrected_delta_b = (delta_b + correction_b).to(factor_b.dtype)
-    direction_a = (-corrected_delta_a.float() / learning_rate).to(factor_a.dtype)
-    direction_b = (-corrected_delta_b.float() / learning_rate).to(factor_b.dtype)
+    residual_left = top_left - a @ coefficient_a
+    residual_right = top_right - b.mT @ coefficient_b
+    mapped_a = ma - head_shift * torch.outer(residual_left, coefficient_b)
+    mapped_b = mb - head_shift * torch.outer(coefficient_a, top_right)
 
-    pre_sumsq = lowrank_sum_frobenius_squared(
-        [(delta_a, b), (a, delta_b), (delta_a, delta_b)]
+    direction_a, direction_b, metrics = product_adamrms_directions(
+        factor_a,
+        factor_b,
+        mapped_a,
+        mapped_b,
+        target_rms=target_rms,
     )
-    post_sumsq = lowrank_sum_frobenius_squared(
-        [
-            (corrected_delta_a, b),
-            (a, corrected_delta_b),
-            (corrected_delta_a, corrected_delta_b),
-        ]
+    metrics.update(
+        {
+            "original_product_momentum_sigma1": sigma1,
+            "original_product_momentum_sigma2": sigma2,
+            "original_product_momentum_sigma1_to_sigma2": sigma1
+            / sigma2.clamp_min(EPS),
+            "intended_original_top_coefficient": torch.ones_like(sigma1),
+            "intended_second_singular_value": sigma2,
+            "top_component_shift": head_shift,
+        }
     )
-    metrics: dict[str, torch.Tensor] = {
-        "pre_sigma1": sigma1,
-        "pre_sigma2": sigma2,
-        "pre_sigma1_to_sigma2": sigma1 / sigma2.clamp_min(EPS),
-        "target_tau": sigma2,
-        "head_beta": beta,
-        "head_fraction_removed": beta / sigma1.clamp_min(EPS),
-        "pre_update_frobenius": torch.sqrt(pre_sumsq),
-        "post_update_frobenius": torch.sqrt(post_sumsq),
-        "relative_frobenius_change": (
-            torch.sqrt(post_sumsq) - torch.sqrt(pre_sumsq)
-        ).abs()
-        / torch.sqrt(pre_sumsq).clamp_min(EPS),
-    }
-    if collect_post_metrics:
-        post_singular, _, _, _ = approximate_update_top2(
-            a,
-            b,
-            corrected_delta_a,
-            corrected_delta_b,
+    if collect_spectral_metrics:
+        mapped_terms = [(mapped_a, b), (a, mapped_b)]
+        mapped_singular, _, _, _ = approximate_lowrank_sum_top2(
+            mapped_terms,
             left_basis=next_basis,
             power_iterations=power_iterations,
             seed=seed,
         )
+        mapped_top_coefficient = torch.dot(
+            top_left,
+            _lowrank_sum_matmul(mapped_terms, top_right),
+        )
+        desired_sumsq = lowrank_sum_frobenius_squared(
+            momentum_terms
+            + [(-head_shift * top_left[:, None], top_right[None, :])]
+        )
+        tangent_error = (
+            head_shift.abs()
+            * torch.linalg.vector_norm(residual_left)
+            * torch.linalg.vector_norm(residual_right)
+        )
+        multiplier = metrics["product_adamrms_multiplier"]
+        left_residual = torch.linalg.vector_norm(
+            _lowrank_sum_matmul(momentum_terms, top_right)
+            - sigma1 * top_left
+        ) / sigma1.clamp_min(EPS)
+        right_residual = torch.linalg.vector_norm(
+            _lowrank_sum_transpose_matmul(momentum_terms, top_left)
+            - sigma1 * top_right
+        ) / sigma1.clamp_min(EPS)
         metrics.update(
             {
-                "post_sigma1": post_singular[0],
-                "post_sigma2": post_singular[1],
-                "post_sigma1_to_sigma2": post_singular[0]
-                / post_singular[1].clamp_min(EPS),
+                "top_left_singular_residual_relative": left_residual,
+                "top_right_singular_residual_relative": right_residual,
+                "mapped_sigma1": mapped_singular[0],
+                "mapped_sigma2": mapped_singular[1],
+                "mapped_sigma1_to_sigma2": mapped_singular[0]
+                / mapped_singular[1].clamp_min(EPS),
+                "mapped_original_top_coefficient": mapped_top_coefficient,
+                "mapped_original_top_coefficient_error": (
+                    mapped_top_coefficient - 1.0
+                ).abs(),
+                "desired_to_mapped_relative_frobenius_error": tangent_error
+                / torch.sqrt(desired_sumsq).clamp_min(EPS),
+                "scaled_mapped_sigma1": mapped_singular[0] * multiplier,
+                "scaled_mapped_sigma2": mapped_singular[1] * multiplier,
+                "scaled_original_top_coefficient": mapped_top_coefficient
+                * multiplier,
             }
         )
     return direction_a, direction_b, next_basis, metrics

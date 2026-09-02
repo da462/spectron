@@ -4,11 +4,11 @@ import math
 
 from factor_product_updates import (
     approximate_update_top2,
-    headclip_directions,
     metrics_to_float,
     product_adamrms_directions,
     product_update_metrics,
     rankaware_product_adamrms_directions,
+    top_singular_pin_directions,
 )
 from lora_muon import apply_lora_muon_step, lora_muon_factor_directions
 
@@ -83,9 +83,15 @@ def zeropower_via_newtonschulz5(G, steps: int):
     return X
 
 
-def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True, adjust_lr_fn='original'):
+def muon_momentum_proposal(grad, momentum, beta=0.95, nesterov=True):
     momentum.lerp_(grad, 1 - beta)
-    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    return grad.lerp_(momentum, beta) if nesterov else momentum
+
+
+def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True, adjust_lr_fn='original'):
+    update = muon_momentum_proposal(
+        grad, momentum, beta=beta, nesterov=nesterov
+    )
     if update.ndim == 4: # for the case of conv filters
         update = update.view(len(update), -1)
     update = zeropower_via_newtonschulz5(update, steps=ns_steps)
@@ -115,21 +121,38 @@ def _step_paired_factor_muon(optimizer, group):
     variant = group["factor_update_variant"]
     proposal_adjustment = (
         "none"
-        if variant in {"product_adamrms", "rankaware_product_adamrms"}
+        if variant
+        in {
+            "product_adamrms",
+            "rankaware_product_adamrms",
+            "top_singular_pin",
+        }
         else "match_rms_adamw"
     )
-    direction_a = muon_update(
-        factor_a.grad,
-        optimizer.state[factor_a]["momentum_buffer"],
-        beta=group["momentum"],
-        adjust_lr_fn=proposal_adjustment,
-    )
-    direction_b = muon_update(
-        factor_b.grad,
-        optimizer.state[factor_b]["momentum_buffer"],
-        beta=group["momentum"],
-        adjust_lr_fn=proposal_adjustment,
-    )
+    if variant == "top_singular_pin":
+        direction_a = muon_momentum_proposal(
+            factor_a.grad,
+            optimizer.state[factor_a]["momentum_buffer"],
+            beta=group["momentum"],
+        )
+        direction_b = muon_momentum_proposal(
+            factor_b.grad,
+            optimizer.state[factor_b]["momentum_buffer"],
+            beta=group["momentum"],
+        )
+    else:
+        direction_a = muon_update(
+            factor_a.grad,
+            optimizer.state[factor_a]["momentum_buffer"],
+            beta=group["momentum"],
+            adjust_lr_fn=proposal_adjustment,
+        )
+        direction_b = muon_update(
+            factor_b.grad,
+            optimizer.state[factor_b]["momentum_buffer"],
+            beta=group["momentum"],
+            adjust_lr_fn=proposal_adjustment,
+        )
     metrics_due = bool(getattr(optimizer, "pair_metrics_due", False))
     pair_index = int(group.get("factor_pair_index", 0))
     pair_state = optimizer.state[factor_a]
@@ -166,19 +189,27 @@ def _step_paired_factor_muon(optimizer, group):
             metrics["post_sigma1_to_sigma2"] = singular[0] / singular[1].clamp_min(
                 1e-12
             )
-    elif variant == "headclip":
-        direction_a, direction_b, basis, metrics = headclip_directions(
+    elif variant == "top_singular_pin":
+        direction_a, direction_b, basis, metrics = top_singular_pin_directions(
             factor_a,
             factor_b,
             direction_a,
             direction_b,
-            learning_rate=group["lr"],
-            left_basis=pair_state.get("headclip_left_basis"),
-            power_iterations=group.get("headclip_power_iterations", 4),
+            left_basis=pair_state.get("top_singular_pin_left_basis"),
+            power_iterations=group.get("top_singular_pin_power_iterations", 6),
             seed=pair_index,
-            collect_post_metrics=metrics_due,
+            collect_spectral_metrics=metrics_due,
         )
-        pair_state["headclip_left_basis"] = basis.to(factor_a.dtype)
+        pair_state["top_singular_pin_left_basis"] = basis.to(factor_a.dtype)
+        if metrics_due:
+            metrics.update(
+                product_update_metrics(
+                    factor_a,
+                    factor_b,
+                    -group["lr"] * direction_a,
+                    -group["lr"] * direction_b,
+                )
+            )
     else:
         raise ValueError(f"Unknown factor update variant: {variant}")
 
@@ -334,7 +365,7 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
                 if group["factor_update_variant"] not in {
                     "product_adamrms",
                     "rankaware_product_adamrms",
-                    "headclip",
+                    "top_singular_pin",
                 }:
                     raise ValueError(
                         f"Unknown factor update variant: {group['factor_update_variant']}"
@@ -485,7 +516,7 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                 if group["factor_update_variant"] not in {
                     "product_adamrms",
                     "rankaware_product_adamrms",
-                    "headclip",
+                    "top_singular_pin",
                 }:
                     raise ValueError(
                         f"Unknown factor update variant: {group['factor_update_variant']}"

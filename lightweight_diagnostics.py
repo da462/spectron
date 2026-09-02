@@ -53,18 +53,23 @@ _PAIR_METRIC_FIELDS = (
     "rankaware_dense_min_dimension",
     "rankaware_effective_rank_cap",
     "rankaware_target_scale",
-    "pre_sigma1",
-    "pre_sigma2",
-    "pre_sigma1_to_sigma2",
-    "target_tau",
-    "head_beta",
-    "head_fraction_removed",
-    "post_sigma1",
-    "post_sigma2",
-    "post_sigma1_to_sigma2",
-    "pre_update_frobenius",
-    "post_update_frobenius",
-    "relative_frobenius_change",
+    "original_product_momentum_sigma1",
+    "original_product_momentum_sigma2",
+    "original_product_momentum_sigma1_to_sigma2",
+    "intended_original_top_coefficient",
+    "intended_second_singular_value",
+    "top_component_shift",
+    "top_left_singular_residual_relative",
+    "top_right_singular_residual_relative",
+    "mapped_sigma1",
+    "mapped_sigma2",
+    "mapped_sigma1_to_sigma2",
+    "mapped_original_top_coefficient",
+    "mapped_original_top_coefficient_error",
+    "desired_to_mapped_relative_frobenius_error",
+    "scaled_mapped_sigma1",
+    "scaled_mapped_sigma2",
+    "scaled_original_top_coefficient",
 )
 
 _PAIR_FIELDS_BY_VARIANT = {
@@ -99,19 +104,32 @@ _PAIR_FIELDS_BY_VARIANT = {
         "post_sigma2",
         "post_sigma1_to_sigma2",
     ),
-    "headclip": (
-        "pre_sigma1",
-        "pre_sigma2",
-        "pre_sigma1_to_sigma2",
-        "target_tau",
-        "head_beta",
-        "head_fraction_removed",
-        "post_sigma1",
-        "post_sigma2",
-        "post_sigma1_to_sigma2",
-        "pre_update_frobenius",
-        "post_update_frobenius",
-        "relative_frobenius_change",
+    "top_singular_pin": (
+        "pre_first_order_direction_rms",
+        "product_adamrms_multiplier",
+        "target_first_order_direction_rms",
+        "first_order_direction_rms",
+        "first_order_update_rms",
+        "actual_update_rms",
+        "quadratic_to_first_frobenius",
+        "actual_update_frobenius",
+        "original_product_momentum_sigma1",
+        "original_product_momentum_sigma2",
+        "original_product_momentum_sigma1_to_sigma2",
+        "intended_original_top_coefficient",
+        "intended_second_singular_value",
+        "top_component_shift",
+        "top_left_singular_residual_relative",
+        "top_right_singular_residual_relative",
+        "mapped_sigma1",
+        "mapped_sigma2",
+        "mapped_sigma1_to_sigma2",
+        "mapped_original_top_coefficient",
+        "mapped_original_top_coefficient_error",
+        "desired_to_mapped_relative_frobenius_error",
+        "scaled_mapped_sigma1",
+        "scaled_mapped_sigma2",
+        "scaled_original_top_coefficient",
     ),
 }
 
@@ -909,7 +927,11 @@ class LightweightDiagnostics:
                     for field in _PAIR_FIELDS_BY_VARIANT[variant]
                 }
             )
-            if variant in {"product_adamrms", "rankaware_product_adamrms"}:
+            if variant in {
+                "product_adamrms",
+                "rankaware_product_adamrms",
+                "top_singular_pin",
+            }:
                 pair_group = next(
                     group
                     for group in self.optimizer.param_groups

@@ -88,8 +88,8 @@ elif [[ "$SUBMIT_LOWRANK_OPTIMIZER" == "product_adamrms" ]]; then
   JOB_SUFFIX="${JOB_SUFFIX}_productadamrms"
 elif [[ "$SUBMIT_LOWRANK_OPTIMIZER" == "rankaware_product_adamrms" ]]; then
   JOB_SUFFIX="${JOB_SUFFIX}_rankawareproductadamrms"
-elif [[ "$SUBMIT_LOWRANK_OPTIMIZER" == "headclip" ]]; then
-  JOB_SUFFIX="${JOB_SUFFIX}_headclip"
+elif [[ "$SUBMIT_LOWRANK_OPTIMIZER" == "top_singular_pin" ]]; then
+  JOB_SUFFIX="${JOB_SUFFIX}_toppin"
 fi
 if [[ "$SUBMIT_SPECTRAL_LR_TARGET" != "all" ]]; then
   TARGET_TAG="${SUBMIT_SPECTRAL_LR_TARGET//[^a-zA-Z0-9]/}"
@@ -344,8 +344,8 @@ elif [[ "\$LOWRANK_OPTIMIZER" == "product_adamrms" ]]; then
   RUN_SUFFIX="\${RUN_SUFFIX}_productadamrms"
 elif [[ "\$LOWRANK_OPTIMIZER" == "rankaware_product_adamrms" ]]; then
   RUN_SUFFIX="\${RUN_SUFFIX}_rankawareproductadamrms"
-elif [[ "\$LOWRANK_OPTIMIZER" == "headclip" ]]; then
-  RUN_SUFFIX="\${RUN_SUFFIX}_headclip"
+elif [[ "\$LOWRANK_OPTIMIZER" == "top_singular_pin" ]]; then
+  RUN_SUFFIX="\${RUN_SUFFIX}_toppin"
 fi
 if [[ "\$SPECTRAL_LR_TARGET" != "all" ]]; then
   TARGET_TAG="\${SPECTRAL_LR_TARGET//[^a-zA-Z0-9]/}"

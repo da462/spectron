@@ -870,7 +870,7 @@ def main():
             'lora_muon',
             'product_adamrms',
             'rankaware_product_adamrms',
-            'headclip',
+            'top_singular_pin',
         ],
         help='Optimizer geometry for native low-rank A/B pairs',
     )
@@ -1574,7 +1574,12 @@ def main():
                 pair_group['factor_pair_index'] = pair_index
                 pair_group['proposal_adjust_lr_fn'] = (
                     'none'
-                    if variant in {'product_adamrms', 'rankaware_product_adamrms'}
+                    if variant
+                    in {
+                        'product_adamrms',
+                        'rankaware_product_adamrms',
+                        'top_singular_pin',
+                    }
                     else 'match_rms_adamw'
                 )
             param_groups.append(pair_group)
@@ -1642,9 +1647,10 @@ def main():
                     "target 0.2*sqrt(min(2r,q)/q)"
                 )
                 print("  FFN factor WD: standard independent factor decay")
-            elif args.lowrank_optimizer == 'headclip':
-                print("  FFN proposal: independent factor AdamRMS")
-                print("  FFN correction: tangent HeadClip with tau=sigma2")
+            elif args.lowrank_optimizer == 'top_singular_pin':
+                print("  FFN proposal: pre-NS product-space momentum")
+                print("  FFN correction: pin original top singular coefficient to 1")
+                print("  FFN scaling: shared product-space AdamRMS target 0.2")
         else:
             print(f"  Learning rate: {args.max_lr}")
             print(f"  Adam betas: ({args.adam_beta1}, {args.adam_beta2})")

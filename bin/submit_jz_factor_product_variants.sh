@@ -40,4 +40,4 @@ submit_variant() {
 }
 
 submit_variant rankaware_product_adamrms
-submit_variant headclip
+submit_variant top_singular_pin

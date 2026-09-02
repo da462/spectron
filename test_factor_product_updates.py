@@ -8,13 +8,17 @@ import torch
 
 from factor_product_updates import (
     approximate_update_top2,
-    headclip_directions,
     lowrank_sum_frobenius_squared,
     product_adamrms_directions,
     product_update_metrics,
     rankaware_product_adamrms_directions,
+    top_singular_pin_directions,
 )
-from muon_local import SingleDeviceMuonWithAuxAdam, muon_update
+from muon_local import (
+    SingleDeviceMuonWithAuxAdam,
+    muon_momentum_proposal,
+    muon_update,
+)
 from lightweight_diagnostics import LightweightDiagnostics
 from low_rank_linear import replace_linear_with_lowrank
 from titan_gpt import TitanGPT, TitanModelArgs
@@ -129,57 +133,81 @@ class FactorProductPrimitiveTests(unittest.TestCase):
         )
         torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
 
-    def test_headclip_reduces_the_actual_product_update_head(self) -> None:
-        factor_a = torch.randn(9, 7)
-        factor_b = torch.randn(7, 7)
-        direction_a = torch.randn_like(factor_a)
-        direction_b = torch.randn_like(factor_b)
-        lr = 0.02
-        base_da = -lr * direction_a
-        base_db = -lr * direction_b
-        before = (
-            base_da @ factor_b
-            + factor_a @ base_db
-            + base_da @ base_db
-        )
-        clipped_a, clipped_b, _, metrics = headclip_directions(
+    def test_top_singular_pin_changes_only_the_original_head(self) -> None:
+        factor_a = torch.randn(5, 5)
+        factor_b = torch.randn(5, 7)
+        momentum_a = 3.0 * torch.randn_like(factor_a)
+        momentum_b = 3.0 * torch.randn_like(factor_b)
+        original = momentum_a @ factor_b + factor_a @ momentum_b
+        u, singular, vh = torch.linalg.svd(original, full_matrices=False)
+        expected = original - (singular[0] - 1.0) * torch.outer(u[:, 0], vh[0])
+
+        direction_a, direction_b, _, metrics = top_singular_pin_directions(
             factor_a,
             factor_b,
-            direction_a,
-            direction_b,
-            learning_rate=lr,
-            power_iterations=20,
-            collect_post_metrics=True,
+            momentum_a,
+            momentum_b,
+            power_iterations=40,
+            collect_spectral_metrics=True,
         )
-        after_da = -lr * clipped_a
-        after_db = -lr * clipped_b
-        after = (
-            after_da @ factor_b
-            + factor_a @ after_db
-            + after_da @ after_db
+        multiplier = metrics["product_adamrms_multiplier"]
+        mapped = (
+            direction_a.float() @ factor_b / multiplier
+            + factor_a @ direction_b.float() / multiplier
         )
-        before_s = torch.linalg.svdvals(before)[:2]
-        after_s = torch.linalg.svdvals(after)[:2]
-        self.assertLess(float(after_s[0] / after_s[1]), float(before_s[0] / before_s[1]))
-        self.assertLess(float(metrics["post_sigma1_to_sigma2"]), float(metrics["pre_sigma1_to_sigma2"]))
+        torch.testing.assert_close(mapped, expected, rtol=2e-4, atol=2e-4)
+        achieved_coefficient = u[:, 0] @ mapped @ vh[0]
+        torch.testing.assert_close(
+            achieved_coefficient, torch.tensor(1.0), rtol=2e-4, atol=2e-4
+        )
+        scaled = direction_a @ factor_b + factor_a @ direction_b
+        torch.testing.assert_close(
+            scaled.norm() / math.sqrt(scaled.numel()),
+            torch.tensor(0.2),
+            rtol=2e-5,
+            atol=2e-5,
+        )
+        self.assertLess(
+            float(metrics["desired_to_mapped_relative_frobenius_error"]),
+            2e-4,
+        )
 
-    def test_headclip_zero_lr_is_an_exact_noop(self) -> None:
+    def test_top_singular_pin_maps_the_target_to_the_factor_tangent(self) -> None:
         factor_a = torch.randn(9, 3)
         factor_b = torch.randn(3, 7)
-        direction_a = torch.randn_like(factor_a)
-        direction_b = torch.randn_like(factor_b)
-        actual_a, actual_b, _, metrics = headclip_directions(
+        momentum_a = 2.0 * torch.randn_like(factor_a)
+        momentum_b = 2.0 * torch.randn_like(factor_b)
+        original = momentum_a @ factor_b + factor_a @ momentum_b
+        u, singular, vh = torch.linalg.svd(original, full_matrices=False)
+        desired = original - (singular[0] - 1.0) * torch.outer(u[:, 0], vh[0])
+        left = torch.linalg.qr(factor_a, mode="reduced").Q
+        right = torch.linalg.qr(factor_b.mT, mode="reduced").Q
+        expected = (
+            left @ (left.mT @ desired)
+            + desired @ right @ right.mT
+            - left @ (left.mT @ desired @ right) @ right.mT
+        )
+        actual_a, actual_b, _, metrics = top_singular_pin_directions(
             factor_a,
             factor_b,
-            direction_a,
-            direction_b,
-            learning_rate=0.0,
-            collect_post_metrics=True,
+            momentum_a,
+            momentum_b,
+            power_iterations=40,
+            collect_spectral_metrics=True,
         )
-        torch.testing.assert_close(actual_a, direction_a)
-        torch.testing.assert_close(actual_b, direction_b)
-        self.assertEqual(float(metrics["pre_sigma1"]), 0.0)
-        self.assertEqual(float(metrics["post_sigma1"]), 0.0)
+        multiplier = metrics["product_adamrms_multiplier"]
+        mapped = (
+            actual_a.float() @ factor_b / multiplier
+            + factor_a @ actual_b.float() / multiplier
+        )
+        torch.testing.assert_close(mapped, expected, rtol=4e-4, atol=4e-4)
+        expected_error = (desired - expected).norm() / desired.norm()
+        torch.testing.assert_close(
+            metrics["desired_to_mapped_relative_frobenius_error"],
+            expected_error,
+            rtol=5e-4,
+            atol=5e-4,
+        )
 
 
 class PairedFactorOptimizerTests(unittest.TestCase):
@@ -291,6 +319,92 @@ class PairedFactorOptimizerTests(unittest.TestCase):
             metrics["rankaware_product_target_rms"],
             expected_direction_rms,
             places=6,
+        )
+
+    def test_top_singular_pin_optimizer_uses_pre_ns_momentum(self) -> None:
+        initial_a = torch.randn(7, 3)
+        initial_b = torch.randn(3, 9)
+        grad_a = torch.randn_like(initial_a)
+        grad_b = torch.randn_like(initial_b)
+        lr = 0.007
+        wd = 0.1
+        beta = 0.95
+
+        buffer_a = torch.zeros_like(initial_a)
+        buffer_b = torch.zeros_like(initial_b)
+        momentum_a = muon_momentum_proposal(grad_a.clone(), buffer_a, beta=beta)
+        momentum_b = muon_momentum_proposal(grad_b.clone(), buffer_b, beta=beta)
+        expected_a, expected_b, _, _ = top_singular_pin_directions(
+            initial_a,
+            initial_b,
+            momentum_a,
+            momentum_b,
+            seed=0,
+        )
+
+        factor_a = torch.nn.Parameter(initial_a.clone())
+        factor_b = torch.nn.Parameter(initial_b.clone())
+        factor_a.grad = grad_a.clone()
+        factor_b.grad = grad_b.clone()
+        optimizer = SingleDeviceMuonWithAuxAdam(
+            [
+                {
+                    "params": [factor_a, factor_b],
+                    "use_muon": False,
+                    "factor_update_variant": "top_singular_pin",
+                    "factor_pair_index": 0,
+                    "pair_name": "layers.0.feed_forward.w1",
+                    "lr": lr,
+                    "momentum": beta,
+                    "weight_decay": wd,
+                }
+            ]
+        )
+        optimizer.step()
+        torch.testing.assert_close(
+            factor_a,
+            initial_a * (1.0 - lr * wd) - lr * expected_a,
+        )
+        torch.testing.assert_close(
+            factor_b,
+            initial_b * (1.0 - lr * wd) - lr * expected_b,
+        )
+        torch.testing.assert_close(
+            optimizer.state[factor_a]["momentum_buffer"], buffer_a
+        )
+        torch.testing.assert_close(
+            optimizer.state[factor_b]["momentum_buffer"], buffer_b
+        )
+
+    def test_top_singular_pin_observer_reports_target_and_mapping(self) -> None:
+        factor_a = torch.nn.Parameter(torch.randn(8, 3))
+        factor_b = torch.nn.Parameter(torch.randn(3, 10))
+        factor_a.grad = torch.randn_like(factor_a)
+        factor_b.grad = torch.randn_like(factor_b)
+        optimizer = SingleDeviceMuonWithAuxAdam(
+            [
+                {
+                    "params": [factor_a, factor_b],
+                    "use_muon": False,
+                    "factor_update_variant": "top_singular_pin",
+                    "factor_pair_index": 0,
+                    "pair_name": "layers.0.feed_forward.w1",
+                    "lr": 0.007,
+                    "weight_decay": 0.1,
+                }
+            ]
+        )
+        rows = []
+        optimizer.pair_update_observer = lambda *args: rows.append(args)
+        optimizer.pair_metrics_due = True
+        optimizer.step()
+        self.assertEqual(len(rows), 1)
+        metrics = rows[0][1]
+        self.assertAlmostEqual(metrics["first_order_update_rms"], 0.0014, places=6)
+        self.assertEqual(metrics["intended_original_top_coefficient"], 1.0)
+        self.assertTrue(math.isfinite(metrics["mapped_sigma1"]))
+        self.assertTrue(
+            math.isfinite(metrics["desired_to_mapped_relative_frobenius_error"])
         )
 
     def test_rankaware_pair_metrics_flow_through_lightweight_diagnostics(self) -> None:
@@ -425,7 +539,7 @@ class ProductVariantLauncherTests(unittest.TestCase):
             self.assertIn(expected, launcher)
         self.assertEqual(launcher.count("submit_variant "), 2)
         self.assertIn("submit_variant rankaware_product_adamrms", launcher)
-        self.assertIn("submit_variant headclip", launcher)
+        self.assertIn("submit_variant top_singular_pin", launcher)
 
     def test_rankaware_launcher_submits_only_the_replacement_job(self) -> None:
         launcher = (
@@ -435,7 +549,17 @@ class ProductVariantLauncherTests(unittest.TestCase):
         ).read_text()
         self.assertIn("MODEL_TAG=factor_muon_rankaware_product_adamrms", launcher)
         self.assertIn("LOWRANK_OPTIMIZER=rankaware_product_adamrms", launcher)
-        self.assertNotIn("LOWRANK_OPTIMIZER=headclip", launcher)
+        self.assertNotIn("LOWRANK_OPTIMIZER=top_singular_pin", launcher)
+
+    def test_top_singular_pin_launcher_pins_the_baseline_protocol(self) -> None:
+        launcher = (
+            Path(__file__).parent / "bin" / "submit_jz_top_singular_pin.sh"
+        ).read_text()
+        self.assertIn("LOWRANK_OPTIMIZER=top_singular_pin", launcher)
+        self.assertIn("MAX_LR=7e-3", launcher)
+        self.assertIn("WEIGHT_DECAY=0.1", launcher)
+        self.assertIn("ADJUST_MUON_LR=match_rms_adamw", launcher)
+        self.assertIn("EMBEDDING_INIT_STD=0.02", launcher)
 
 
 if __name__ == "__main__":
