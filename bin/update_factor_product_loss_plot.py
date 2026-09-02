@@ -30,7 +30,7 @@ class Run:
 RUNS = (
     Run("Factor-Muon", "1656518", "#222222"),
     Run("Rank-aware Product-AdamRMS", "1673742", "#167d9a"),
-    Run("HeadClip", "1673961", "#b94c3a"),
+    Run("Top singular pin", "1682418", "#b94c3a"),
 )
 
 
