@@ -127,22 +127,6 @@ def tail_mean(rows: list[tuple[int, float]], count: int = 100) -> float:
     return sum(value for _, value in tail) / len(tail)
 
 
-def matched_tail_ppl_gap(
-    baseline: list[tuple[int, float]],
-    candidate: list[tuple[int, float]],
-    count: int = 100,
-) -> tuple[int, float] | None:
-    baseline_by_step = dict(baseline)
-    candidate_by_step = dict(candidate)
-    shared = sorted(set(baseline_by_step) & set(candidate_by_step))
-    if len(shared) < count:
-        return None
-    steps = shared[-count:]
-    baseline_ce = sum(baseline_by_step[step] for step in steps) / count
-    candidate_ce = sum(candidate_by_step[step] for step in steps) / count
-    return steps[-1], 100.0 * (math.exp(candidate_ce - baseline_ce) - 1.0)
-
-
 def write_csv(path: Path, curves: dict[str, list[tuple[int, float]]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:
@@ -158,8 +142,8 @@ def plot(
     states: dict[str, str],
     ema_decay: float,
 ) -> None:
-    fig, axes = plt.subplots(2, 1, figsize=(10.5, 8.3))
-    fig.subplots_adjust(left=0.10, right=0.98, bottom=0.09, top=0.86, hspace=0.18)
+    fig, axis = plt.subplots(figsize=(10.5, 5.8))
+    fig.subplots_adjust(left=0.10, right=0.98, bottom=0.13, top=0.84)
     for run in RUNS:
         rows = curves.get(run.label, [])
         if not rows:
@@ -173,65 +157,28 @@ def plot(
             f"tail-100 {tail:.4f})"
         )
         smoothed = ema(values, ema_decay)
-        for axis in axes:
-            axis.plot(
-                steps,
-                values,
-                color=run.color,
-                alpha=0.11,
-                linewidth=0.55,
-            )
-            axis.plot(
-                steps,
-                smoothed,
-                color=run.color,
-                linewidth=2.0,
-                label=label,
-            )
-
-    axes[0].set_title("Full trajectory", fontsize=11)
-    axes[1].set_title("Late-training detail", fontsize=11)
-    axes[0].set_xlim(0, 2234)
-    axes[1].set_xlim(400, 2234)
-    late_values = [
-        value
-        for rows in curves.values()
-        for step, value in rows
-        if step >= 400
-    ]
-    if late_values:
-        low, high = min(late_values), max(late_values)
-        padding = max(0.03, 0.05 * (high - low))
-        axes[1].set_ylim(low - padding, high + padding)
-    axes[1].set_xlabel("Optimizer step")
-    for axis in axes:
-        axis.set_ylabel("Training cross-entropy")
-        axis.grid(True, alpha=0.20)
-    axes[0].legend(frameon=False, fontsize=9)
-    baseline = curves.get("Factor-Muon", [])
-    comparisons = []
-    for run in RUNS[1:]:
-        result = matched_tail_ppl_gap(baseline, curves.get(run.label, []))
-        if result is not None:
-            step, gap = result
-            comparisons.append(
-                f"{run.label}: {gap:+.2f}% PPL at matched tail-100 ending step {step}"
-            )
-    if comparisons:
-        axes[1].text(
-            0.02,
-            0.04,
-            "\n".join(comparisons),
-            transform=axes[1].transAxes,
-            fontsize=8.5,
-            va="bottom",
-            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.82},
+        axis.plot(
+            steps,
+            values,
+            color=run.color,
+            alpha=0.11,
+            linewidth=0.55,
         )
-    available = set(curves)
-    absent = [run.label for run in RUNS if run.label not in available]
+        axis.plot(
+            steps,
+            smoothed,
+            color=run.color,
+            linewidth=2.0,
+            label=label,
+        )
+
+    axis.set_xlim(0, 2234)
+    axis.set_ylim(top=3.4)
+    axis.set_xlabel("Optimizer step")
+    axis.set_ylabel("Training cross-entropy")
+    axis.grid(True, alpha=0.20)
+    axis.legend(frameon=False, fontsize=9)
     subtitle = "LR and schedule 7e-3 | WD 0.1 | embedding std 0.02 | 4-rank mean"
-    if absent:
-        subtitle += "\nAwaiting logs: " + ", ".join(absent)
     fig.suptitle(
         "Low-rank FFN product-update comparison\n" + subtitle,
         fontsize=12,
