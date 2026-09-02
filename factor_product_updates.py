@@ -195,8 +195,43 @@ def headclip_directions(
     collect_post_metrics: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Apply one tangent-space correction that clips sigma1(D) to sigma2(D)."""
-    if learning_rate <= 0:
-        raise ValueError("HeadClip requires a positive learning rate")
+    if learning_rate < 0:
+        raise ValueError("HeadClip requires a non-negative learning rate")
+    if learning_rate == 0:
+        if left_basis is None or left_basis.shape != (factor_a.shape[0], 2):
+            left_basis = _deterministic_basis(
+                factor_a.shape[0],
+                2,
+                device=factor_a.device,
+                seed=seed,
+            )
+        left_basis = torch.linalg.qr(left_basis.float(), mode="reduced").Q
+        zero = torch.zeros((), device=factor_a.device, dtype=torch.float32)
+        metrics = {
+            "pre_sigma1": zero,
+            "pre_sigma2": zero,
+            "pre_sigma1_to_sigma2": zero,
+            "target_tau": zero,
+            "head_beta": zero,
+            "head_fraction_removed": zero,
+            "pre_update_frobenius": zero,
+            "post_update_frobenius": zero,
+            "relative_frobenius_change": zero,
+        }
+        if collect_post_metrics:
+            metrics.update(
+                {
+                    "post_sigma1": zero,
+                    "post_sigma2": zero,
+                    "post_sigma1_to_sigma2": zero,
+                }
+            )
+        return (
+            baseline_direction_a,
+            baseline_direction_b,
+            left_basis,
+            metrics,
+        )
     a = factor_a.float()
     b = factor_b.float()
     delta_a = -learning_rate * baseline_direction_a.float()

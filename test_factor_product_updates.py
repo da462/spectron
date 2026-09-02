@@ -123,6 +123,24 @@ class FactorProductPrimitiveTests(unittest.TestCase):
         self.assertLess(float(after_s[0] / after_s[1]), float(before_s[0] / before_s[1]))
         self.assertLess(float(metrics["post_sigma1_to_sigma2"]), float(metrics["pre_sigma1_to_sigma2"]))
 
+    def test_headclip_zero_lr_is_an_exact_noop(self) -> None:
+        factor_a = torch.randn(9, 3)
+        factor_b = torch.randn(3, 7)
+        direction_a = torch.randn_like(factor_a)
+        direction_b = torch.randn_like(factor_b)
+        actual_a, actual_b, _, metrics = headclip_directions(
+            factor_a,
+            factor_b,
+            direction_a,
+            direction_b,
+            learning_rate=0.0,
+            collect_post_metrics=True,
+        )
+        torch.testing.assert_close(actual_a, direction_a)
+        torch.testing.assert_close(actual_b, direction_b)
+        self.assertEqual(float(metrics["pre_sigma1"]), 0.0)
+        self.assertEqual(float(metrics["post_sigma1"]), 0.0)
+
 
 class PairedFactorOptimizerTests(unittest.TestCase):
     def setUp(self) -> None:
