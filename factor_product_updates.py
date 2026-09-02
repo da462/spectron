@@ -68,8 +68,65 @@ def product_adamrms_directions(
     return direction_a, direction_b, {
         "pre_first_order_direction_rms": pre_rms,
         "product_adamrms_multiplier": multiplier,
+        "target_first_order_direction_rms": torch.as_tensor(
+            target_rms, device=pre_rms.device, dtype=pre_rms.dtype
+        ),
         "first_order_direction_rms": applied_rms,
     }
+
+
+def rankaware_product_adamrms_directions(
+    factor_a: torch.Tensor,
+    factor_b: torch.Tensor,
+    raw_direction_a: torch.Tensor,
+    raw_direction_b: torch.Tensor,
+    *,
+    dense_target_rms: float = 0.2,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Calibrate product RMS per singular direction available at rank ``r``."""
+    output_features, rank = factor_a.shape
+    factor_rank, input_features = factor_b.shape
+    if factor_rank != rank:
+        raise ValueError(
+            f"Incompatible factor ranks: A is {tuple(factor_a.shape)}, "
+            f"B is {tuple(factor_b.shape)}"
+        )
+    q = min(output_features, input_features)
+    k = min(2 * rank, q)
+    target_rms = dense_target_rms * (k / q) ** 0.5
+    direction_a, direction_b, metrics = product_adamrms_directions(
+        factor_a,
+        factor_b,
+        raw_direction_a,
+        raw_direction_b,
+        target_rms=target_rms,
+    )
+    metrics.update(
+        {
+            "dense_product_target_rms": torch.as_tensor(
+                dense_target_rms,
+                device=factor_a.device,
+                dtype=torch.float32,
+            ),
+            "rankaware_product_target_rms": torch.as_tensor(
+                target_rms,
+                device=factor_a.device,
+                dtype=torch.float32,
+            ),
+            "rankaware_dense_min_dimension": torch.as_tensor(
+                q, device=factor_a.device, dtype=torch.float32
+            ),
+            "rankaware_effective_rank_cap": torch.as_tensor(
+                k, device=factor_a.device, dtype=torch.float32
+            ),
+            "rankaware_target_scale": torch.as_tensor(
+                (k / q) ** 0.5,
+                device=factor_a.device,
+                dtype=torch.float32,
+            ),
+        }
+    )
+    return direction_a, direction_b, metrics
 
 
 def _update_matmul(

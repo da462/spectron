@@ -39,5 +39,5 @@ submit_variant() {
   "$SCRIPT_DIR/submit_jz_ttmatched_spectron.sh" "$PROFILE" lowrank_ffn
 }
 
-submit_variant product_adamrms
+submit_variant rankaware_product_adamrms
 submit_variant headclip

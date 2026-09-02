@@ -86,6 +86,8 @@ if [[ "$SUBMIT_LOWRANK_OPTIMIZER" == "lora_muon" ]]; then
   JOB_SUFFIX="${JOB_SUFFIX}_loramuon"
 elif [[ "$SUBMIT_LOWRANK_OPTIMIZER" == "product_adamrms" ]]; then
   JOB_SUFFIX="${JOB_SUFFIX}_productadamrms"
+elif [[ "$SUBMIT_LOWRANK_OPTIMIZER" == "rankaware_product_adamrms" ]]; then
+  JOB_SUFFIX="${JOB_SUFFIX}_rankawareproductadamrms"
 elif [[ "$SUBMIT_LOWRANK_OPTIMIZER" == "headclip" ]]; then
   JOB_SUFFIX="${JOB_SUFFIX}_headclip"
 fi
@@ -340,6 +342,8 @@ if [[ "\$LOWRANK_OPTIMIZER" == "lora_muon" ]]; then
   RUN_SUFFIX="\${RUN_SUFFIX}_loramuon"
 elif [[ "\$LOWRANK_OPTIMIZER" == "product_adamrms" ]]; then
   RUN_SUFFIX="\${RUN_SUFFIX}_productadamrms"
+elif [[ "\$LOWRANK_OPTIMIZER" == "rankaware_product_adamrms" ]]; then
+  RUN_SUFFIX="\${RUN_SUFFIX}_rankawareproductadamrms"
 elif [[ "\$LOWRANK_OPTIMIZER" == "headclip" ]]; then
   RUN_SUFFIX="\${RUN_SUFFIX}_headclip"
 fi

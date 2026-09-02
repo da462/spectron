@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROFILE="${1:-a100_4_dev2h_cpu30_whj}"
+DIAGNOSTIC_BATCH="${MECHANISTIC_DIAGNOSTIC_BATCH:-/lustre/fswork/projects/rech/qps/ulf36rc/spectron_data/mechanistic/fineweb_first4_seq2048.pt}"
+export JZ_VENV="${JZ_VENV:-/lustre/fswork/projects/rech/qps/ulf36rc/spectron/.venv_spectron}"
+
+MODEL_TAG=factor_muon_rankaware_product_adamrms \
+TOTAL_STEPS=2234 \
+LR_SCHEDULE_STEPS=2234 \
+MAX_LR=7e-3 \
+OPTIMIZER=muon \
+LOWRANK_OPTIMIZER=rankaware_product_adamrms \
+WEIGHT_DECAY=0.1 \
+NH_WEIGHT_DECAY=0.1 \
+ADJUST_MUON_LR=match_rms_adamw \
+EMBEDDING_INIT_STD=0.02 \
+TT_STYLE_INIT=0 \
+SPECTRAL_LR_SCALING=0 \
+SPECTRAL_WEIGHT_DECAY=0.0 \
+LOWRANK_FFN_LR_MULTIPLIER=1.0 \
+LOW_RANK_RATIO=0.25 \
+LOW_RANK_W2_SAME_RANK_AS_W1W3=0 \
+GLOBAL_BATCH_SIZE=512 \
+MICRO_BATCH_SIZE=16 \
+SEQUENCE_LENGTH=2048 \
+MECHANISTIC_DIAGNOSTICS=1 \
+MECHANISTIC_DIAGNOSTIC_BATCH="$DIAGNOSTIC_BATCH" \
+LIGHTWEIGHT_DIAGNOSTICS=1 \
+LIGHTWEIGHT_PRODUCT_INTERVAL=100 \
+CHECKPOINT_INTERVAL_STEPS=500 \
+CHECKPOINT_KEEP_LATEST_K=1 \
+SKIP_FINAL_EVAL=1 \
+WANDB_MODE=offline \
+"$SCRIPT_DIR/submit_jz_ttmatched_spectron.sh" "$PROFILE" lowrank_ffn

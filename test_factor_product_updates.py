@@ -12,6 +12,7 @@ from factor_product_updates import (
     lowrank_sum_frobenius_squared,
     product_adamrms_directions,
     product_update_metrics,
+    rankaware_product_adamrms_directions,
 )
 from muon_local import SingleDeviceMuonWithAuxAdam, muon_update
 from lightweight_diagnostics import LightweightDiagnostics
@@ -47,6 +48,45 @@ class FactorProductPrimitiveTests(unittest.TestCase):
         torch.testing.assert_close(
             metrics["first_order_direction_rms"], dense_rms, rtol=2e-5, atol=2e-5
         )
+
+    def test_rankaware_product_adamrms_hits_available_rank_target(self) -> None:
+        factor_a = torch.randn(11, 2)
+        factor_b = torch.randn(2, 13)
+        direction_a, direction_b, metrics = (
+            rankaware_product_adamrms_directions(
+                factor_a,
+                factor_b,
+                torch.randn_like(factor_a),
+                torch.randn_like(factor_b),
+            )
+        )
+        dense = direction_a @ factor_b + factor_a @ direction_b
+        expected = 0.2 * math.sqrt(4 / 11)
+        actual = dense.norm() / math.sqrt(dense.numel())
+        torch.testing.assert_close(
+            actual, torch.tensor(expected), rtol=2e-5, atol=2e-5
+        )
+        self.assertEqual(float(metrics["rankaware_dense_min_dimension"]), 11.0)
+        self.assertEqual(float(metrics["rankaware_effective_rank_cap"]), 4.0)
+        torch.testing.assert_close(
+            metrics["rankaware_product_target_rms"], actual
+        )
+
+    def test_rankaware_target_saturates_at_dense_target(self) -> None:
+        factor_a = torch.randn(7, 4)
+        factor_b = torch.randn(4, 9)
+        direction_a, direction_b, metrics = (
+            rankaware_product_adamrms_directions(
+                factor_a,
+                factor_b,
+                torch.randn_like(factor_a),
+                torch.randn_like(factor_b),
+            )
+        )
+        dense = direction_a @ factor_b + factor_a @ direction_b
+        actual = dense.norm() / math.sqrt(dense.numel())
+        torch.testing.assert_close(actual, torch.tensor(0.2), rtol=2e-5, atol=2e-5)
+        self.assertEqual(float(metrics["rankaware_effective_rank_cap"]), 7.0)
 
     def test_product_update_metrics_match_dense_update(self) -> None:
         factor_a = torch.randn(8, 3)
@@ -219,7 +259,41 @@ class PairedFactorOptimizerTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["first_order_update_rms"], 0.0014, places=6)
         self.assertTrue(math.isfinite(metrics["actual_update_rms"]))
 
-    def test_product_pair_metrics_flow_through_lightweight_diagnostics(self) -> None:
+    def test_rankaware_pair_observer_reports_rank_scaled_target(self) -> None:
+        factor_a = torch.nn.Parameter(torch.randn(8, 2))
+        factor_b = torch.nn.Parameter(torch.randn(2, 10))
+        factor_a.grad = torch.randn_like(factor_a)
+        factor_b.grad = torch.randn_like(factor_b)
+        optimizer = SingleDeviceMuonWithAuxAdam(
+            [
+                {
+                    "params": [factor_a, factor_b],
+                    "use_muon": False,
+                    "factor_update_variant": "rankaware_product_adamrms",
+                    "pair_name": "layers.0.feed_forward.w1",
+                    "lr": 0.007,
+                    "weight_decay": 0.1,
+                }
+            ]
+        )
+        rows = []
+        optimizer.pair_update_observer = lambda *args: rows.append(args)
+        optimizer.pair_metrics_due = True
+        optimizer.step()
+        metrics = rows[0][1]
+        expected_direction_rms = 0.2 * math.sqrt(4 / 8)
+        self.assertAlmostEqual(
+            metrics["first_order_update_rms"],
+            0.007 * expected_direction_rms,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            metrics["rankaware_product_target_rms"],
+            expected_direction_rms,
+            places=6,
+        )
+
+    def test_rankaware_pair_metrics_flow_through_lightweight_diagnostics(self) -> None:
         model = TitanGPT(
             TitanModelArgs(
                 vocab_size=64,
@@ -269,7 +343,7 @@ class PairedFactorOptimizerTests(unittest.TestCase):
                 {
                     "params": [factors["A"][1], factors["B"][1]],
                     "use_muon": False,
-                    "factor_update_variant": "product_adamrms",
+                    "factor_update_variant": "rankaware_product_adamrms",
                     "factor_pair_index": pair_index,
                     "pair_name": pair_name,
                     "pair_param_names": (factors["A"][0], factors["B"][0]),
@@ -313,8 +387,20 @@ class PairedFactorOptimizerTests(unittest.TestCase):
                 ).read_text().splitlines()
             ]
         self.assertEqual(len(rows), 6)
-        self.assertTrue(all(row["factor_update_variant"] == "product_adamrms" for row in rows))
+        self.assertTrue(
+            all(
+                row["factor_update_variant"] == "rankaware_product_adamrms"
+                for row in rows
+            )
+        )
         self.assertTrue(all(row["first_order_target_relative_error"] < 1e-4 for row in rows))
+        self.assertTrue(
+            all(
+                row["rankaware_product_target_rms"]
+                == row["target_first_order_direction_rms"]
+                for row in rows
+            )
+        )
 
 
 class ProductVariantLauncherTests(unittest.TestCase):
@@ -338,8 +424,18 @@ class ProductVariantLauncherTests(unittest.TestCase):
         ):
             self.assertIn(expected, launcher)
         self.assertEqual(launcher.count("submit_variant "), 2)
-        self.assertIn("submit_variant product_adamrms", launcher)
+        self.assertIn("submit_variant rankaware_product_adamrms", launcher)
         self.assertIn("submit_variant headclip", launcher)
+
+    def test_rankaware_launcher_submits_only_the_replacement_job(self) -> None:
+        launcher = (
+            Path(__file__).parent
+            / "bin"
+            / "submit_jz_rankaware_product_adamrms.sh"
+        ).read_text()
+        self.assertIn("MODEL_TAG=factor_muon_rankaware_product_adamrms", launcher)
+        self.assertIn("LOWRANK_OPTIMIZER=rankaware_product_adamrms", launcher)
+        self.assertNotIn("LOWRANK_OPTIMIZER=headclip", launcher)
 
 
 if __name__ == "__main__":

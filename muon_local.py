@@ -8,6 +8,7 @@ from factor_product_updates import (
     metrics_to_float,
     product_adamrms_directions,
     product_update_metrics,
+    rankaware_product_adamrms_directions,
 )
 from lora_muon import apply_lora_muon_step, lora_muon_factor_directions
 
@@ -113,7 +114,9 @@ def _step_paired_factor_muon(optimizer, group):
 
     variant = group["factor_update_variant"]
     proposal_adjustment = (
-        "none" if variant == "product_adamrms" else "match_rms_adamw"
+        "none"
+        if variant in {"product_adamrms", "rankaware_product_adamrms"}
+        else "match_rms_adamw"
     )
     direction_a = muon_update(
         factor_a.grad,
@@ -131,8 +134,13 @@ def _step_paired_factor_muon(optimizer, group):
     pair_index = int(group.get("factor_pair_index", 0))
     pair_state = optimizer.state[factor_a]
 
-    if variant == "product_adamrms":
-        direction_a, direction_b, metrics = product_adamrms_directions(
+    if variant in {"product_adamrms", "rankaware_product_adamrms"}:
+        calibrate = (
+            rankaware_product_adamrms_directions
+            if variant == "rankaware_product_adamrms"
+            else product_adamrms_directions
+        )
+        direction_a, direction_b, metrics = calibrate(
             factor_a, factor_b, direction_a, direction_b
         )
         if metrics_due:
@@ -325,6 +333,7 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
                     raise ValueError("Paired factor groups require exactly one A/B pair")
                 if group["factor_update_variant"] not in {
                     "product_adamrms",
+                    "rankaware_product_adamrms",
                     "headclip",
                 }:
                     raise ValueError(
@@ -475,6 +484,7 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                     raise ValueError("Paired factor groups require exactly one A/B pair")
                 if group["factor_update_variant"] not in {
                     "product_adamrms",
+                    "rankaware_product_adamrms",
                     "headclip",
                 }:
                     raise ValueError(

@@ -869,6 +869,7 @@ def main():
             'factor_muon',
             'lora_muon',
             'product_adamrms',
+            'rankaware_product_adamrms',
             'headclip',
         ],
         help='Optimizer geometry for native low-rank A/B pairs',
@@ -1572,7 +1573,9 @@ def main():
                 pair_group['factor_update_variant'] = variant
                 pair_group['factor_pair_index'] = pair_index
                 pair_group['proposal_adjust_lr_fn'] = (
-                    'none' if variant == 'product_adamrms' else 'match_rms_adamw'
+                    'none'
+                    if variant in {'product_adamrms', 'rankaware_product_adamrms'}
+                    else 'match_rms_adamw'
                 )
             param_groups.append(pair_group)
         if not factor_pairs:
@@ -1632,6 +1635,12 @@ def main():
                 print("  FFN factor WD: split product decay")
             elif args.lowrank_optimizer == 'product_adamrms':
                 print("  FFN factor LR: shared product-space AdamRMS target 0.2")
+                print("  FFN factor WD: standard independent factor decay")
+            elif args.lowrank_optimizer == 'rankaware_product_adamrms':
+                print(
+                    "  FFN factor LR: shared rank-aware product-space AdamRMS "
+                    "target 0.2*sqrt(min(2r,q)/q)"
+                )
                 print("  FFN factor WD: standard independent factor decay")
             elif args.lowrank_optimizer == 'headclip':
                 print("  FFN proposal: independent factor AdamRMS")

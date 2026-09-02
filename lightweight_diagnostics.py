@@ -42,11 +42,17 @@ _PAIR_METRIC_FIELDS = (
     "present",
     "pre_first_order_direction_rms",
     "product_adamrms_multiplier",
+    "target_first_order_direction_rms",
     "first_order_direction_rms",
     "first_order_update_rms",
     "actual_update_rms",
     "quadratic_to_first_frobenius",
     "actual_update_frobenius",
+    "dense_product_target_rms",
+    "rankaware_product_target_rms",
+    "rankaware_dense_min_dimension",
+    "rankaware_effective_rank_cap",
+    "rankaware_target_scale",
     "pre_sigma1",
     "pre_sigma2",
     "pre_sigma1_to_sigma2",
@@ -65,11 +71,30 @@ _PAIR_FIELDS_BY_VARIANT = {
     "product_adamrms": (
         "pre_first_order_direction_rms",
         "product_adamrms_multiplier",
+        "target_first_order_direction_rms",
         "first_order_direction_rms",
         "first_order_update_rms",
         "actual_update_rms",
         "quadratic_to_first_frobenius",
         "actual_update_frobenius",
+        "post_sigma1",
+        "post_sigma2",
+        "post_sigma1_to_sigma2",
+    ),
+    "rankaware_product_adamrms": (
+        "pre_first_order_direction_rms",
+        "product_adamrms_multiplier",
+        "target_first_order_direction_rms",
+        "first_order_direction_rms",
+        "first_order_update_rms",
+        "actual_update_rms",
+        "quadratic_to_first_frobenius",
+        "actual_update_frobenius",
+        "dense_product_target_rms",
+        "rankaware_product_target_rms",
+        "rankaware_dense_min_dimension",
+        "rankaware_effective_rank_cap",
+        "rankaware_target_scale",
         "post_sigma1",
         "post_sigma2",
         "post_sigma1_to_sigma2",
@@ -884,13 +909,15 @@ class LightweightDiagnostics:
                     for field in _PAIR_FIELDS_BY_VARIANT[variant]
                 }
             )
-            if variant == "product_adamrms":
+            if variant in {"product_adamrms", "rankaware_product_adamrms"}:
                 pair_group = next(
                     group
                     for group in self.optimizer.param_groups
                     if group.get("pair_name") == pair_name
                 )
-                target = 0.2 * float(pair_group["lr"])
+                target = row["target_first_order_direction_rms"] * float(
+                    pair_group["lr"]
+                )
                 row["target_first_order_update_rms"] = target
                 row["first_order_target_relative_error"] = abs(
                     row["first_order_update_rms"] - target
