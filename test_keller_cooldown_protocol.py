@@ -163,6 +163,53 @@ class TestKellerCooldownProtocol(unittest.TestCase):
         for fragment in expected:
             self.assertIn(fragment, script)
 
+    def test_dedicated_launcher_accepts_spectron_split_lr_override(self) -> None:
+        root = Path(__file__).resolve().parent
+        launcher = root / "bin" / "submit_jz_keller_cooldown.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "DRY_RUN": "1",
+                    "JOB_DIR": str(Path(tmp) / "jobs"),
+                    "LOG_DIR": str(Path(tmp) / "logs"),
+                    "MAX_LR": "5e-3",
+                    "SPECTRAL_LR_SCALING": "1",
+                    "SPECTRAL_LR_TARGET": "ffn",
+                    "LOWRANK_FFN_LR_MULTIPLIER": "2.0",
+                    "WEIGHT_DECAY": "0",
+                    "NH_WEIGHT_DECAY": "0",
+                }
+            )
+            subprocess.run(
+                [
+                    "bash",
+                    str(launcher),
+                    "a100_4_dev2h_cpu10_whj",
+                    "lowrank_ffn",
+                ],
+                cwd=root,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            jobs = list((Path(tmp) / "jobs").glob("*.slurm"))
+            self.assertEqual(len(jobs), 1)
+            script = jobs[0].read_text()
+
+        expected = (
+            'MAX_LR="${MAX_LR:-5e-3}"',
+            'SPECTRAL_LR_SCALING="${SPECTRAL_LR_SCALING:-1}"',
+            'SPECTRAL_LR_TARGET="${SPECTRAL_LR_TARGET:-ffn}"',
+            'LOWRANK_FFN_LR_MULTIPLIER="${LOWRANK_FFN_LR_MULTIPLIER:-2.0}"',
+            'WEIGHT_DECAY="${WEIGHT_DECAY:-0}"',
+            'NH_WEIGHT_DECAY="${NH_WEIGHT_DECAY:-0}"',
+            "--spectral_lr_scaling",
+        )
+        for fragment in expected:
+            self.assertIn(fragment, script)
+
 
 if __name__ == "__main__":
     unittest.main()
