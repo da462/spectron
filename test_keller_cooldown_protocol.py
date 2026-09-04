@@ -116,6 +116,53 @@ class TestKellerCooldownProtocol(unittest.TestCase):
         for fragment in expected:
             self.assertIn(fragment, script)
 
+    def test_dedicated_launcher_accepts_adamrms_protocol_override(self) -> None:
+        root = Path(__file__).resolve().parent
+        launcher = root / "bin" / "submit_jz_keller_cooldown.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env.update(
+                {
+                    "DRY_RUN": "1",
+                    "JOB_DIR": str(Path(tmp) / "jobs"),
+                    "LOG_DIR": str(Path(tmp) / "logs"),
+                    "MODEL_TAG": "adamrms_cooldown",
+                    "MAX_LR": "1e-3",
+                    "ADJUST_MUON_LR": "match_rms_adamw",
+                    "AUX_ADAMW_LR_MULTIPLIER": "1.0",
+                    "WEIGHT_DECAY": "0.1",
+                    "NH_WEIGHT_DECAY": "0.1",
+                }
+            )
+            subprocess.run(
+                [
+                    "bash",
+                    str(launcher),
+                    "a100_4_dev2h_cpu30_whj",
+                    "lowrank_ffn",
+                ],
+                cwd=root,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            jobs = list((Path(tmp) / "jobs").glob("*.slurm"))
+            self.assertEqual(len(jobs), 1)
+            script = jobs[0].read_text()
+
+        expected = (
+            'MAX_LR="${MAX_LR:-1e-3}"',
+            'ADJUST_MUON_LR="${ADJUST_MUON_LR:-match_rms_adamw}"',
+            'AUX_ADAMW_LR_MULTIPLIER="${AUX_ADAMW_LR_MULTIPLIER:-1.0}"',
+            'WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"',
+            'NH_WEIGHT_DECAY="${NH_WEIGHT_DECAY:-0.1}"',
+            'SCHEDULER="${SCHEDULER:-stable_linear_decay}"',
+            'STABLE_DECAY_FRACTION="${STABLE_DECAY_FRACTION:-0.3}"',
+        )
+        for fragment in expected:
+            self.assertIn(fragment, script)
+
 
 if __name__ == "__main__":
     unittest.main()
