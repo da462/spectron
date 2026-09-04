@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROFILE="${1:-a100_4_dev2h_cpu30_whj}"
+PROFILE="${1:-a100_4_dev2h_cpu10_whj}"
 RUN_MODE="${2:-lowrank_ffn}"
 
 case "$RUN_MODE" in
